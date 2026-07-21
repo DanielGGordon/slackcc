@@ -1,0 +1,22 @@
+{
+  "_comment": "Map each Slack channel id to a project. The bot ONLY responds in channels listed here (scoping). Get a channel id by right-clicking the channel in Slack > View channel details, or from the URL. backend 't3' routes turns into a T3 Code project (1:1 channel<->project, persona lives in that project's CLAUDE.md); backend 'claude' (default) drives the Claude Agent SDK directly with the persona/tools below.",
+  "channels": {
+    "C0XXXXXXXXX": {
+      "project": "my-project",
+      "cwd": "/home/you/projects/my-project",
+      "backend": "t3",
+      "t3_project_id": "00000000-0000-0000-0000-000000000000",
+      "t3_model": {"instanceId": "claudeAgent", "model": "claude-sonnet-5"},
+      "timeout": 900
+    },
+    "C0YYYYYYYYY": {
+      "project": "another-project",
+      "cwd": "/home/you/projects/another-project",
+      "backend": "claude",
+      "persona": "You are an engineer embedded in this project. Answer questions, triage bugs, and implement changes ONLY within this project. If asked about anything outside it, politely decline.",
+      "allowed_tools": ["Read", "Glob", "Grep", "Bash(git log:*)", "Bash(git diff:*)", "Bash(git status:*)"],
+      "permission_mode": "acceptEdits",
+      "timeout": 600
+    }
+  }
+}

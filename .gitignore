@@ -1,0 +1,21 @@
+# Secrets — never commit. Live tokens for Slack, T3.
+.env
+.env.*
+!.env.example
+
+# Live routing/permission config (real channel ids, user ids); ship *.example.json instead.
+config/channels.json
+config/senders.json
+
+# Runtime state
+.state/
+.slack-incoming/
+nohup.out
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+build/
+dist/

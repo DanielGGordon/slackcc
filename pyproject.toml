@@ -1,0 +1,24 @@
+[project]
+name = "slackcc"
+version = "0.1.0"
+description = "Slack <-> Claude Code bridge (Socket Mode daemon). Part 1: autonomous back-and-forth messaging."
+requires-python = ">=3.11"
+dependencies = [
+    "slack-bolt>=1.18",
+    "slack-sdk>=3.27",
+    "claude-agent-sdk>=0.2.110",
+]
+
+[project.scripts]
+slackcc = "slackcc.__main__:main"
+slack-send = "slackcc.send_cli:main"
+slack-wait-reply = "slackcc.wait_cli:main"
+slack-upload = "slackcc.upload_cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+packages = ["slackcc"]
