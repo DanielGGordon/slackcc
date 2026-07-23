@@ -22,3 +22,12 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 package-dir = { "" = "src" }
 packages = ["slackcc"]
+
+[tool.pytest.ini_options]
+# `pytest tests/` runs the hermetic offline suite only. The live tier
+# (real pps + local guard LLM, real inference) is opt-in:
+#   .venv/bin/python -m pytest tests/ -m live
+markers = [
+    "live: hits the running pps service and local guard LLM (real inference, ~30s)",
+]
+addopts = "-m 'not live'"
