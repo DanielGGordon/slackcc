@@ -150,7 +150,8 @@ def test_judge_non_json_response_returns_error():
         client = PPSClient(srv.url)
         verdict = client.judge(sender="a", policy="p", text="t", context="c")
         assert verdict["verdict"] == "error"
-        assert "pps unreachable" in verdict["reason"]
+        # Reachable-but-garbage is distinguished from an outage in the reason.
+        assert "malformed pps response" in verdict["reason"]
 
 
 def test_judge_url_trailing_slash_is_stripped():

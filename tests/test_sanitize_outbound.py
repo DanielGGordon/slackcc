@@ -184,16 +184,11 @@ def test_scrub_redacts_anthropic_style_sk_ant_key(monkeypatch):
 
     clean, findings = scrub(text)
 
-    # KNOWN BUG (documented, not fixed here): the "openai-key" pattern
-    # (\bsk-[A-Za-z0-9_-]{20,}\b) is checked before "anthropic-key" in
-    # _PATTERNS and greedily matches the whole "sk-ant-..." token first,
-    # so `re.sub` consumes it under the openai-key label before the
-    # anthropic-key pattern ever gets a chance to match. The value is
-    # still fully redacted (no leak), but the finding label is wrong:
-    # it reports "openai-key" instead of "anthropic-key".
+    # anthropic-key is ordered before the generic sk- pattern in _PATTERNS,
+    # so sk-ant- keys are labeled correctly rather than consumed as openai-key.
     assert key not in clean
-    assert "[redacted:openai-key]" in clean
-    assert findings == ["openai-key"]
+    assert "[redacted:anthropic-key]" in clean
+    assert findings == ["anthropic-key"]
 
 
 def test_scrub_redacts_keyish_assignment_preserving_key_and_separator(monkeypatch):

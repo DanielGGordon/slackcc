@@ -26,11 +26,17 @@ class PPSClient:
         )
         try:
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                verdict = json.load(resp)
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+                body = resp.read()
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
             log.warning("pps unreachable: %s", exc)
             return {"verdict": "error", "category": "other",
                     "reason": f"pps unreachable: {exc}", "stage": "none", "latency_ms": 0}
+        try:
+            verdict = json.loads(body)
+        except json.JSONDecodeError as exc:
+            log.warning("pps returned non-JSON: %s", exc)
+            return {"verdict": "error", "category": "other",
+                    "reason": f"malformed pps response: {exc}", "stage": "none", "latency_ms": 0}
         if verdict.get("verdict") not in ("allow", "deny", "error"):
             return {"verdict": "error", "category": "other",
                     "reason": "malformed pps response", "stage": "none", "latency_ms": 0}

@@ -64,6 +64,10 @@ class _SeenSet:
         if not key:
             return False
         if key in self._d:
+            # LRU refresh: a repeated key stays protected from eviction, so a
+            # late Slack retry can't slip past dedup just because the window
+            # rolled over other traffic in between.
+            self._d.move_to_end(key)
             return True
         self._d[key] = None
         if len(self._d) > self._maxlen:
