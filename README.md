@@ -94,6 +94,20 @@ pip install -e .
 Now post a message in the configured channel — the bot replies in-thread, and
 each thread stays one continuous Claude Code conversation.
 
+## Testing
+
+```bash
+.venv/bin/python -m pytest tests/          # offline suite: 187 hermetic tests, ~6s
+.venv/bin/python -m pytest tests/ -m live  # + judge-quality tier: real inference
+                                           #   against the running pps/guard LLM (~20s)
+```
+
+The offline suite is the regression net (no network, no live services — safe
+anywhere, including CI). The `live` tier is the model tripwire: attack prompts
+must deny, benign guest work must allow — run it after swapping the guard
+model, changing quantization, or editing the judge prompt. It auto-skips when
+pps isn't running.
+
 ## Agent-initiated outbound
 
 To have Claude Code (or you) post into a channel from a project:
