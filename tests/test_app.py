@@ -340,6 +340,19 @@ def test_seenset_maxlen_evicts_oldest():
     assert seen.seen("k4") is True
 
 
+def test_seenset_repeat_hit_refreshes_recency():
+    seen = _SeenSet(maxlen=3)
+    seen.seen("k1")
+    seen.seen("k2")
+    seen.seen("k3")
+    # Re-seeing k1 marks it recent (LRU refresh), so the next eviction takes
+    # k2 — a late Slack retry of k1 stays deduped across window rollover.
+    assert seen.seen("k1") is True
+    assert seen.seen("k4") is False
+    assert seen.seen("k1") is True
+    assert seen.seen("k2") is False
+
+
 # --------------------------------------------------------------------------- #
 # _pps_policy_text
 # --------------------------------------------------------------------------- #

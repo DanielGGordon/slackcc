@@ -23,8 +23,10 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
     ("aws-key-id", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("github-token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b")),
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\b")),
-    ("openai-key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b")),
+    # anthropic before openai: the generic sk- pattern would otherwise consume
+    # sk-ant- keys first and mislabel the finding.
     ("anthropic-key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b")),
+    ("openai-key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b")),
     ("keyish-assignment", re.compile(
         r"(?i)\b(api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token|"
         r"client[_-]?secret|password)\b(\s*[=:]\s*)(['\"]?)([A-Za-z0-9_\-/+.]{16,})")),
