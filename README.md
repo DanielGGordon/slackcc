@@ -37,9 +37,10 @@ Slack channel ──(Socket Mode)──> slackcc daemon ──┬──> backend
   in `<<<EXTERNAL_UNTRUSTED_CONTENT>>>` markers plus the matching directive
   (`sanitize.py`).
 - **Bridge protocol lives outside the prompt:** each turn carries one routing
-  line (`[slack channel=… thread=… protocol=~/.claude/slack-bridge.md]`); how to
-  reply, upload files, and post extra messages is documented in
-  `~/.claude/slack-bridge.md`, which the agent's global `CLAUDE.md` points at.
+  line (`[slack channel=… thread=…]`). How to reply, upload files, and post
+  extra messages ships with the package (`src/slackcc/data/slack-bridge.md`) and
+  reaches the agent through its system prompt (`claude` backend) or the
+  project's `CLAUDE.md` (`t3` backend — see step 4).
 
 ## 1. Create the Slack app (one-time)
 
@@ -100,10 +101,32 @@ pip install -e .
 Now post a message in the configured channel — the bot replies in-thread, and
 each thread stays one continuous Claude Code conversation.
 
+## 4. Teach the project the bridge protocol (`t3` backend only)
+
+The agent needs standing instructions — your reply is auto-posted, here's how to
+upload a file, here's the trust model. On the `claude` backend that rides in the
+system prompt and there's nothing to do. T3's `thread.turn.start` has no
+system-prompt field, but T3 spawns sessions with setting sources
+`user,project,local`, so the project's own `CLAUDE.md` is the free channel:
+
+```bash
+slackcc init-project                    # every t3 channel's cwd in channels.json
+slackcc init-project ~/projects/foo     # or a specific project
+```
+
+This writes a marker-delimited `## Slack Bridge` section into that project's
+`CLAUDE.md`, rewriting it in place on later runs (your own content is
+untouched). **Commit it** — T3 threads can run in a git worktree, which only
+sees committed files.
+
+Skipping this is not fatal: the daemon detects the missing section and injects
+the protocol inline on the first turn of each thread instead, logging a warning.
+That costs tokens once per thread rather than never.
+
 ## Testing
 
 ```bash
-.venv/bin/python -m pytest tests/          # offline suite: 187 hermetic tests, ~6s
+.venv/bin/python -m pytest tests/          # offline suite: 204 hermetic tests, ~6s
 .venv/bin/python -m pytest tests/ -m live  # + judge-quality tier: real inference
                                            #   against the running pps/guard LLM (~20s)
 ```
@@ -136,7 +159,9 @@ src/slackcc/
   outbound.py   secret scrubbing for everything posted to Slack
   config.py     env + channels.json + senders.json loading, per-sender policy
   sessions.py   thread -> session/thread id store (resume continuity)
-  sanitize.py   baseline injection fencing
+  sanitize.py   fencing for the messages pps didn't gate
+  bridgedoc.py  ships/renders/installs the bridge protocol
+  data/slack-bridge.md   the protocol itself (package data)
   send_cli.py   `slack-send` outbound CLI
 config/channels.example.json
 config/senders.example.json
