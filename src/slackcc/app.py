@@ -11,7 +11,7 @@ from pathlib import Path
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-from . import backend, backend_t3, t3_mirror
+from . import backend, backend_t3, bridgedoc, t3_mirror
 from .claims import ClaimStore
 from .config import ChannelConfig, SenderPolicy, Settings
 from .outbound import scrub
@@ -29,6 +29,14 @@ _IGNORED_SUBTYPES = {
     "bot_message", "message_changed", "message_deleted",
     "channel_join", "channel_leave", "thread_broadcast",
 }
+
+
+def bridge_header(channel_id: str, thread_ts: str) -> str:
+    """All a turn needs once the agent knows the protocol: which thread it is.
+
+    The protocol itself comes from the system prompt (claude backend) or the
+    project's CLAUDE.md (t3 backend) -- see bridgedoc.py."""
+    return f"[slack channel={channel_id} thread={thread_ts}]"
 
 
 def _pps_policy_text(sp: SenderPolicy, cfg: ChannelConfig) -> str:
@@ -136,22 +144,24 @@ def build_app(settings: Settings) -> App:
                     logger.warning("file download failed", exc_info=True)
 
         resume = sessions.get(channel_id, thread_ts)
+        sp = settings.sender_policy(user)
 
-        # Tell the agent where it is and how to send files/text back out.
-        # Absolute CLI paths: T3-spawned sessions don't have ~/.local/bin on PATH.
-        bin_dir = Path("~/.local/bin").expanduser()
-        slack_ctx = (
-            f"You are responding inside Slack channel {channel_id}, thread {thread_ts}. "
-            f"Your text reply is posted automatically (don't duplicate it). "
-            f"To send a FILE you produced (image/PDF/audio), run: "
-            f'{bin_dir}/slack-upload {channel_id} <path> --thread {thread_ts} --comment "..." . '
-            f'To post an extra standalone message, run: {bin_dir}/slack-send {channel_id} "..." --thread {thread_ts} .'
-        )
-        persona = "\n\n".join(filter(None, [cfg.persona, SAFETY_PREAMBLE, slack_ctx]))
+        # pps is the screen (below): an owner's message, or a guest's message
+        # that a blocking judge passed, is trusted by the time it gets here and
+        # rides as plain text. Only a guest in log-only mode is ungated, so only
+        # that case still pays for fencing + the security directive.
+        screened = sp.role == "owner" or sp.pps_mode == "enforce"
+
+        header = bridge_header(channel_id, thread_ts)
+        guard = None if screened else SAFETY_PREAMBLE
+        # claude backend: the protocol is free here -- system prompt, every
+        # turn, invisible in the channel. Nothing to install.
+        persona = "\n\n".join(filter(
+            None, [cfg.persona, bridgedoc.render(), header, guard]))
 
         parts: list[str] = []
         if text:
-            parts.append(wrap_untrusted("slack", user, text))
+            parts.append(text if screened else wrap_untrusted("slack", user, text))
         if local_paths:
             listing = "\n".join(f"- {p}" for p in local_paths)
             parts.append(
@@ -181,7 +191,6 @@ def build_app(settings: Settings) -> App:
                 say(text=final_text, thread_ts=thread_ts)
 
         # --- pps gate: blocking prompt-protection screen for non-owner senders ---
-        sp = settings.sender_policy(user)
         if sp.pps_mode != "skip":
             judged = text or ""
             if files:
@@ -205,18 +214,23 @@ def build_app(settings: Settings) -> App:
 
         if cfg.backend == "t3" and t3_client and mirror:
             # Slack thread <-> T3 thread, 1:1, deterministic id (so resume
-            # survives a lost sessions.json). Persona lives in the project's
-            # CLAUDE.md — thread.turn.start has no system-prompt field — so
-            # only the per-thread Slack context rides along in the message.
+            # survives a lost sessions.json). thread.turn.start has no
+            # system-prompt field, so persona and protocol both come from the
+            # project's CLAUDE.md (T3 spawns with setting sources
+            # user,project,local) and only the routing header rides along.
+            #
+            # If `slackcc init-project` hasn't been run there, fall back to
+            # paying for the protocol inline on the first turn of the thread --
+            # the agent gets it either way, just less cheaply.
             thread_id = resume or f"slack-{channel_id}-{thread_ts.replace('.', '-')}"
-            header = (
-                f"[Slack bridge: {slack_ctx}]"
-                if resume
-                else f"[Slack bridge: {slack_ctx}\n{SAFETY_PREAMBLE}]"
-            )
+            protocol = None
+            if resume is None and not bridgedoc.is_installed(cfg.cwd):
+                log.warning("bridge protocol not in %s/CLAUDE.md; injecting inline. "
+                            "Run: slackcc init-project %s", cfg.cwd, cfg.cwd)
+                protocol = bridgedoc.render()
             mirror.register(thread_id, channel_id, thread_ts)
             result = backend_t3.run_turn(
-                prompt=f"{header}\n\n{prompt}",
+                prompt="\n\n".join(filter(None, [header, protocol, guard, prompt])),
                 thread_id=thread_id,
                 is_new=resume is None,
                 project_id=cfg.t3_project_id or "",

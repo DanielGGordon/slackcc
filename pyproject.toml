@@ -23,6 +23,12 @@ build-backend = "setuptools.build_meta"
 package-dir = { "" = "src" }
 packages = ["slackcc"]
 
+# The bridge protocol ships with the package: `slackcc init-project` writes it
+# into a project's CLAUDE.md, and the daemon renders it into the claude
+# backend's system prompt.
+[tool.setuptools.package-data]
+slackcc = ["data/*.md"]
+
 [tool.pytest.ini_options]
 # `pytest tests/` runs the hermetic offline suite only. The live tier
 # (real pps + local guard LLM, real inference) is opt-in:
