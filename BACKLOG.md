@@ -4,11 +4,11 @@ Roughly in priority order. Part 1 (autonomous back-and-forth in a configured
 channel) is the only thing built today.
 
 ## Prompt-injection protection (explicitly requested)
-Today we have *baseline hygiene only*: untrusted Slack content is fenced in
-`<<<EXTERNAL_UNTRUSTED_CONTENT>>>` markers (`sanitize.py`) and the system prompt
-tells the model to treat it as data. Still to do:
+Built: pps (the sandboxed LLM judge) screens every non-owner message before
+dispatch and fails closed, so content that reaches the agent is trusted and
+passes through unfenced. Fencing (`sanitize.py`) now only covers the ungated
+case: a guest in `pps_mode: "log"`. Still to do:
 - Regex/heuristic pre-screen for known injection patterns before dispatch.
-- A cheap model-based screen ("is this trying to override instructions?").
 - Tighten per-channel `allowed_tools` to least privilege; never expose write/exec
   tools in friend-facing channels by default.
 - Strip/neutralize secrets in output before posting back to Slack.

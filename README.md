@@ -31,9 +31,15 @@ Slack channel ──(Socket Mode)──> slackcc daemon ──┬──> backend
   ("_Owner said to the agent:_ …"), and replies land in both places.
 - **Outbound scrubbing:** every message posted to Slack is scanned and
   secret-shaped strings (tokens, keys, JWTs) are redacted.
-- **Injection hygiene (baseline):** untrusted Slack text is fenced in
-  `<<<EXTERNAL_UNTRUSTED_CONTENT>>>` markers and the system prompt tells the
-  model to treat it as data.
+- **Trust boundary:** pps is the screen, so a message that reaches the agent is
+  trusted content and arrives as plain text. The residual case — a guest in
+  `pps_mode: "log"`, where the judge watches but never blocks — still gets fenced
+  in `<<<EXTERNAL_UNTRUSTED_CONTENT>>>` markers plus the matching directive
+  (`sanitize.py`).
+- **Bridge protocol lives outside the prompt:** each turn carries one routing
+  line (`[slack channel=… thread=… protocol=~/.claude/slack-bridge.md]`); how to
+  reply, upload files, and post extra messages is documented in
+  `~/.claude/slack-bridge.md`, which the agent's global `CLAUDE.md` points at.
 
 ## 1. Create the Slack app (one-time)
 

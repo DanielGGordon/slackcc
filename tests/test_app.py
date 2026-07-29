@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from slackcc import app as app_mod
-from slackcc.app import _SeenSet, _pps_policy_text
+from slackcc.app import _SeenSet, _pps_policy_text, bridge_header
 from slackcc.backend import TurnResult
 from slackcc.claims import ClaimStore
 from slackcc.config import ChannelConfig, SenderPolicy, Settings
@@ -741,21 +741,30 @@ def test_handle_file_download_exception_does_not_kill_the_turn(make_env):
 
 
 # --------------------------------------------------------------------------- #
-# handle(): prompt fencing -- wrap_untrusted markers + SAFETY_PREAMBLE
+# handle(): bridge header + fencing only for messages pps didn't gate
 # --------------------------------------------------------------------------- #
 
 
-def test_handle_claude_backend_prompt_is_wrapped_untrusted_content(make_env):
+def test_bridge_header_is_one_line_and_points_at_the_protocol_doc():
+    header = bridge_header("C123", "17.42")
+
+    assert header == "[slack channel=C123 thread=17.42 protocol=~/.claude/slack-bridge.md]"
+    assert "\n" not in header  # per-turn cost is one line, not a preamble
+
+
+def test_handle_claude_backend_screened_prompt_is_plain_text(make_env):
     env = make_env()
     call_handle(env, make_event(channel="Cclaude", user="Uowner", text="hello there",
                                  ts="90.1"))
 
     assert len(env.backend_calls) == 1
     call = env.backend_calls[0]
-    assert call["prompt"] == wrap_untrusted("slack", "Uowner", "hello there")
+    # Owner: pps vouches for it, so no fencing and no security lecture.
+    assert call["prompt"] == "hello there"
+    assert "EXTERNAL_UNTRUSTED_CONTENT" not in call["prompt"]
 
 
-def test_handle_claude_backend_system_prompt_has_preamble_and_persona(make_env):
+def test_handle_claude_backend_system_prompt_has_persona_and_bridge_header(make_env):
     env = make_env()
     call_handle(env, make_event(channel="Cclaude", user="Uowner", text="hello there",
                                  ts="90.2"))
@@ -763,27 +772,48 @@ def test_handle_claude_backend_system_prompt_has_preamble_and_persona(make_env):
     assert len(env.backend_calls) == 1
     system_prompt = env.backend_calls[0]["append_system_prompt"]
     assert "Foo-bot" in system_prompt
-    assert SAFETY_PREAMBLE in system_prompt
-    # Order: channel persona, then the safety preamble, then the Slack context.
-    assert system_prompt.index("Foo-bot") < system_prompt.index(SAFETY_PREAMBLE)
-    assert system_prompt.index(SAFETY_PREAMBLE) < system_prompt.index(
-        "responding inside Slack channel"
-    )
+    assert bridge_header("Cclaude", "90.2") in system_prompt
+    assert SAFETY_PREAMBLE not in system_prompt
+    assert system_prompt.index("Foo-bot") < system_prompt.index("[slack channel=")
 
 
-def test_handle_t3_new_thread_header_embeds_safety_preamble_and_fenced_prompt(make_env):
+def test_handle_claude_backend_unscreened_guest_still_gets_fencing(make_env):
+    env = make_env()
+    # Ulogger is a guest in pps_mode="log": the judge observes but never blocks,
+    # so nothing gated this message and the fence has to stay.
+    call_handle(env, make_event(channel="Cclaude", user="Ulogger", text="hello there",
+                                 ts="90.5"))
+
+    assert len(env.backend_calls) == 1
+    call = env.backend_calls[0]
+    assert call["prompt"] == wrap_untrusted("slack", "Ulogger", "hello there")
+    assert SAFETY_PREAMBLE in call["append_system_prompt"]
+
+
+def test_handle_claude_backend_enforced_guest_is_trusted(make_env):
+    env = make_env()
+    # Unknown sender -> guest_defaults -> pps_mode="enforce": a blocking judge
+    # already passed it, so it arrives as data the agent can act on.
+    call_handle(env, make_event(channel="Cclaude", user="Ustranger", text="hello there",
+                                 ts="90.6"))
+
+    assert len(env.backend_calls) == 1
+    call = env.backend_calls[0]
+    assert call["prompt"] == "hello there"
+    assert SAFETY_PREAMBLE not in call["append_system_prompt"]
+
+
+def test_handle_t3_new_thread_prompt_is_header_plus_plain_text(make_env):
     env = make_env()
     call_handle(env, make_event(channel="Ct3", user="Uowner", text="hi", ts="90.3"))
 
     assert len(env.backend_t3_calls) == 1
     call = env.backend_t3_calls[0]
     assert call["is_new"] is True
-    assert call["prompt"].startswith("[Slack bridge:")
-    assert SAFETY_PREAMBLE in call["prompt"]
-    assert wrap_untrusted("slack", "Uowner", "hi") in call["prompt"]
+    assert call["prompt"] == f'{bridge_header("Ct3", "90.3")}\n\nhi'
 
 
-def test_handle_t3_resume_header_omits_safety_preamble(make_env):
+def test_handle_t3_resume_prompt_carries_the_same_one_line_header(make_env):
     key = SessionStore.key("Ct3", "90.4")
     env = make_env(presession={key: "existing-thread-id"})
     call_handle(env, make_event(channel="Ct3", user="Uowner", text="hi again",
@@ -793,6 +823,18 @@ def test_handle_t3_resume_header_omits_safety_preamble(make_env):
     call = env.backend_t3_calls[0]
     assert call["is_new"] is False
     assert call["thread_id"] == "existing-thread-id"
-    assert "[Slack bridge:" in call["prompt"]
-    assert SAFETY_PREAMBLE not in call["prompt"]
-    assert wrap_untrusted("slack", "Uowner", "hi again") in call["prompt"]
+    # A resumed thread pays exactly what a new one does: one routing line.
+    assert call["prompt"] == f'{bridge_header("Ct3", "90.4")}\n\nhi again'
+
+
+def test_handle_t3_unscreened_guest_gets_the_guard_inline(make_env):
+    env = make_env()
+    # No system-prompt field on the t3 wire, so the directive rides in the
+    # message -- but only for the sender that nothing gated.
+    call_handle(env, make_event(channel="Ct3", user="Ulogger", text="hi", ts="90.7"))
+
+    assert len(env.backend_t3_calls) == 1
+    prompt = env.backend_t3_calls[0]["prompt"]
+    assert prompt.startswith(bridge_header("Ct3", "90.7"))
+    assert SAFETY_PREAMBLE in prompt
+    assert wrap_untrusted("slack", "Ulogger", "hi") in prompt

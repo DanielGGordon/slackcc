@@ -30,6 +30,15 @@ _IGNORED_SUBTYPES = {
     "channel_join", "channel_leave", "thread_broadcast",
 }
 
+# How the agent learns the bridge protocol (reply semantics, slack-send /
+# slack-upload). It is a user-global doc pulled in by ~/.claude/CLAUDE.md, not a
+# per-turn preamble -- all we pass per turn is the thread-specific routing.
+BRIDGE_DOC = "~/.claude/slack-bridge.md"
+
+
+def bridge_header(channel_id: str, thread_ts: str) -> str:
+    return f"[slack channel={channel_id} thread={thread_ts} protocol={BRIDGE_DOC}]"
+
 
 def _pps_policy_text(sp: SenderPolicy, cfg: ChannelConfig) -> str:
     """The permission policy the pps judge applies to this sender's message."""
@@ -136,22 +145,21 @@ def build_app(settings: Settings) -> App:
                     logger.warning("file download failed", exc_info=True)
 
         resume = sessions.get(channel_id, thread_ts)
+        sp = settings.sender_policy(user)
 
-        # Tell the agent where it is and how to send files/text back out.
-        # Absolute CLI paths: T3-spawned sessions don't have ~/.local/bin on PATH.
-        bin_dir = Path("~/.local/bin").expanduser()
-        slack_ctx = (
-            f"You are responding inside Slack channel {channel_id}, thread {thread_ts}. "
-            f"Your text reply is posted automatically (don't duplicate it). "
-            f"To send a FILE you produced (image/PDF/audio), run: "
-            f'{bin_dir}/slack-upload {channel_id} <path> --thread {thread_ts} --comment "..." . '
-            f'To post an extra standalone message, run: {bin_dir}/slack-send {channel_id} "..." --thread {thread_ts} .'
-        )
-        persona = "\n\n".join(filter(None, [cfg.persona, SAFETY_PREAMBLE, slack_ctx]))
+        # pps is the screen (below): an owner's message, or a guest's message
+        # that a blocking judge passed, is trusted by the time it gets here and
+        # rides as plain text. Only a guest in log-only mode is ungated, so only
+        # that case still pays for fencing + the security directive.
+        screened = sp.role == "owner" or sp.pps_mode == "enforce"
+
+        header = bridge_header(channel_id, thread_ts)
+        guard = None if screened else SAFETY_PREAMBLE
+        persona = "\n\n".join(filter(None, [cfg.persona, header, guard]))
 
         parts: list[str] = []
         if text:
-            parts.append(wrap_untrusted("slack", user, text))
+            parts.append(text if screened else wrap_untrusted("slack", user, text))
         if local_paths:
             listing = "\n".join(f"- {p}" for p in local_paths)
             parts.append(
@@ -181,7 +189,6 @@ def build_app(settings: Settings) -> App:
                 say(text=final_text, thread_ts=thread_ts)
 
         # --- pps gate: blocking prompt-protection screen for non-owner senders ---
-        sp = settings.sender_policy(user)
         if sp.pps_mode != "skip":
             judged = text or ""
             if files:
@@ -205,18 +212,13 @@ def build_app(settings: Settings) -> App:
 
         if cfg.backend == "t3" and t3_client and mirror:
             # Slack thread <-> T3 thread, 1:1, deterministic id (so resume
-            # survives a lost sessions.json). Persona lives in the project's
-            # CLAUDE.md — thread.turn.start has no system-prompt field — so
-            # only the per-thread Slack context rides along in the message.
+            # survives a lost sessions.json). thread.turn.start has no
+            # system-prompt field, so the routing header rides in the message;
+            # persona and bridge protocol come from CLAUDE.md on that side.
             thread_id = resume or f"slack-{channel_id}-{thread_ts.replace('.', '-')}"
-            header = (
-                f"[Slack bridge: {slack_ctx}]"
-                if resume
-                else f"[Slack bridge: {slack_ctx}\n{SAFETY_PREAMBLE}]"
-            )
             mirror.register(thread_id, channel_id, thread_ts)
             result = backend_t3.run_turn(
-                prompt=f"{header}\n\n{prompt}",
+                prompt="\n\n".join(filter(None, [header, guard, prompt])),
                 thread_id=thread_id,
                 is_new=resume is None,
                 project_id=cfg.t3_project_id or "",
