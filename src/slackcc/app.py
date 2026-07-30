@@ -5,6 +5,7 @@ in a configured channel converses with the agent autonomously."""
 from __future__ import annotations
 
 import logging
+import time
 from collections import OrderedDict
 from pathlib import Path
 
@@ -229,6 +230,23 @@ def build_app(settings: Settings) -> App:
                             "Run: slackcc init-project %s", cfg.cwd, cfg.cwd)
                 protocol = bridgedoc.render()
             mirror.register(thread_id, channel_id, thread_ts)
+
+            # Live feedback: while the turn runs, edit the placeholder into a
+            # rolling status (agent narration + latest tool call from the T3
+            # snapshot) instead of leaving "working on it…" for minutes.
+            turn_started = time.monotonic()
+
+            def progress(update: str) -> None:
+                if not placeholder_ts:
+                    return
+                mins, secs = divmod(int(time.monotonic() - turn_started), 60)
+                body = scrub(update)[0]
+                client.chat_update(
+                    channel=channel_id, ts=placeholder_ts,
+                    text=(f":hourglass_flowing_sand: _working… {mins}m {secs:02d}s_\n"
+                          f"{body}")[:3900],
+                )
+
             result = backend_t3.run_turn(
                 prompt="\n\n".join(filter(None, [header, protocol, guard, prompt])),
                 thread_id=thread_id,
@@ -240,6 +258,7 @@ def build_app(settings: Settings) -> App:
                 mirror=mirror,
                 timeout=cfg.timeout,
                 runtime_mode=sp.runtime_mode,
+                on_progress=progress,
             )
         else:
             result = backend.run_turn(
