@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from collections import OrderedDict
 from pathlib import Path
 
@@ -230,6 +231,21 @@ def build_app(settings: Settings) -> App:
                             "Run: slackcc init-project %s", cfg.cwd, cfg.cwd)
                 protocol = bridgedoc.render()
             mirror.register(thread_id, channel_id, thread_ts)
+
+            # The user was told "to unsettle this chat, simply reply" — honour it. The
+            # turn below auto-un-settles server-side too, but doing it explicitly also
+            # re-arms the announcement and covers a turn that never starts.
+            if mirror.settled_notice(thread_id) is not None:
+                try:
+                    t3_client.dispatch({
+                        "type": "thread.unsettle",
+                        "commandId": f"slack-uns-{uuid.uuid4().hex}",
+                        "threadId": thread_id,
+                        "reason": "user",
+                    })
+                except Exception:  # noqa: BLE001 - never let this break the turn
+                    log.warning("could not unsettle T3 thread %s", thread_id, exc_info=True)
+                mirror.set_settled_notice(thread_id, None)
 
             # Live feedback: while the turn runs, edit the placeholder into a
             # rolling status (agent narration + latest tool call from the T3

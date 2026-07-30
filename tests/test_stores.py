@@ -289,3 +289,54 @@ def test_mirror_store_tolerates_corrupt_json(tmp_path):
     # Still usable afterward.
     store.register("thread-1", "C1", "111.222")
     assert "thread-1" in store.threads()
+
+
+def test_mirror_store_settled_notice_defaults_to_none(tmp_path):
+    store = MirrorStore(tmp_path / "mirror.json")
+    store.register("thread-1", "C1", "111.222")
+    assert store.settled_notice("thread-1") is None
+    assert store.settled_notice("unknown") is None
+
+
+def test_mirror_store_settled_notice_set_and_clear_roundtrip(tmp_path):
+    store = MirrorStore(tmp_path / "mirror.json")
+    store.register("thread-1", "C1", "111.222")
+    store.set_settled_notice("thread-1", "2026-07-30T12:00:00Z")
+    assert store.settled_notice("thread-1") == "2026-07-30T12:00:00Z"
+    store.set_settled_notice("thread-1", None)
+    assert store.settled_notice("thread-1") is None
+
+
+def test_mirror_store_settled_notice_persists_across_new_instance(tmp_path):
+    path = tmp_path / "mirror.json"
+    store1 = MirrorStore(path)
+    store1.register("thread-1", "C1", "111.222")
+    store1.set_settled_notice("thread-1", "2026-07-30T12:00:00Z")
+
+    store2 = MirrorStore(path)
+    assert store2.settled_notice("thread-1") == "2026-07-30T12:00:00Z"
+
+
+def test_mirror_store_settled_notice_missing_key_in_legacy_json(tmp_path):
+    path = tmp_path / "mirror.json"
+    path.write_text(json.dumps({
+        "threads": {
+            "thread-1": {
+                "channel": "C1",
+                "thread_ts": "111.222",
+                "posted": [],
+            }
+        }
+    }))
+    store = MirrorStore(path)
+    assert store.settled_notice("thread-1") is None
+    store.set_settled_notice("thread-1", "2026-07-30T12:00:00Z")
+    assert store.settled_notice("thread-1") == "2026-07-30T12:00:00Z"
+
+
+def test_mirror_store_register_does_not_clobber_settled_notice(tmp_path):
+    store = MirrorStore(tmp_path / "mirror.json")
+    store.register("thread-1", "C1", "111.222")
+    store.set_settled_notice("thread-1", "2026-07-30T12:00:00Z")
+    store.register("thread-1", "C1", "111.222")
+    assert store.settled_notice("thread-1") == "2026-07-30T12:00:00Z"
