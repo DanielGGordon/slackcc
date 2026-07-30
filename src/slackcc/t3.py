@@ -109,3 +109,27 @@ class MirrorStore:
     def threads(self) -> dict[str, dict]:
         with self._lock:
             return json.loads(json.dumps(self._data["threads"]))
+
+    def settled_notice(self, thread_id: str) -> str | None:
+        """The `settledAt` of the settle we already announced in Slack, if any."""
+        with self._lock:
+            entry = self._data["threads"].get(thread_id)
+            if entry is None:
+                return None
+            return entry.get("settled_notice")
+
+    def set_settled_notice(self, thread_id: str, settled_at: str | None) -> None:
+        """Record (or clear, with None) the announced settle."""
+        with self._lock:
+            entry = self._data["threads"].get(thread_id)
+            if entry is None:
+                return
+            if settled_at is None:
+                if "settled_notice" not in entry:
+                    return
+                del entry["settled_notice"]
+            elif entry.get("settled_notice") == settled_at:
+                return
+            else:
+                entry["settled_notice"] = settled_at
+            self._save()

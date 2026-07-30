@@ -93,6 +93,23 @@ def _sweep(t3: T3Client, slack: WebClient, mirror: MirrorStore, owner: str) -> N
             except Exception:  # noqa: BLE001 - one bad post shouldn't kill the loop
                 log.warning("mirror: slack post failed for %s", thread_id, exc_info=True)
 
+        # Settled is a T3-side lifecycle flag (see t3.py); surface the transition in
+        # Slack so the thread doesn't just go quiet, and tell the user how to undo it.
+        settled_at = (thread.get("settledAt") or "settled") \
+            if thread.get("settledOverride") == "settled" else None
+        previous = entry.get("settled_notice")
+        if settled_at != previous:
+            mirror.set_settled_notice(thread_id, settled_at)
+            # Only the (not settled -> settled) edge is worth a post. A settledAt
+            # that shifts while the thread stays settled -- T3 filling the field a
+            # beat after the override -- updates the record silently.
+            if settled_at and previous is None:
+                try:
+                    _post(slack, entry["channel"], entry["thread_ts"],
+                          f"_{owner} settled this chat. To unsettle this chat, simply reply._")
+                except Exception:  # noqa: BLE001 - one bad post shouldn't kill the loop
+                    log.warning("mirror: settle notice failed for %s", thread_id, exc_info=True)
+
 
 def start(t3: T3Client, slack: WebClient, mirror: MirrorStore, owner: str) -> threading.Thread:
     def loop() -> None:

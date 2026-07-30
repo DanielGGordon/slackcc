@@ -28,7 +28,9 @@ Slack channel ──(Socket Mode)──> slackcc daemon ──┬──> backend
   regardless of what any model decides.
 - **Bidirectional mirror (t3 backend):** messages typed into the T3 GUI on a
   Slack-originated thread are posted back into the Slack thread
-  ("_Owner said to the agent:_ …"), and replies land in both places.
+  ("_Owner said to the agent:_ …"), and replies land in both places. Settling
+  a chat in the T3 UI posts a notice into the Slack thread; replying in Slack
+  un-settles it.
 - **Outbound scrubbing:** every message posted to Slack is scanned and
   secret-shaped strings (tokens, keys, JWTs) are redacted.
 - **Trust boundary:** pps is the screen, so a message that reaches the agent is

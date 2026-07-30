@@ -21,6 +21,7 @@ from slackcc.claims import ClaimStore
 from slackcc.config import ChannelConfig, SenderPolicy, Settings
 from slackcc.sanitize import SAFETY_PREAMBLE, wrap_untrusted
 from slackcc.sessions import SessionStore
+from slackcc.t3 import T3Error
 
 BOT_USER_ID = "UBOT"
 
@@ -113,6 +114,26 @@ class FakePPS:
         return {"verdict": "allow", "category": None, "reason": ""}
 
 
+class FakeT3Client:
+    """Stand-in for T3Client; records dispatch() calls. No HTTP."""
+
+    def __init__(self, base_url, token, timeout=30):
+        self.base_url = base_url
+        self.token = token
+        self.timeout = timeout
+        self.dispatch_calls: list[dict] = []
+        self.dispatch_error: Exception | None = None
+
+    def dispatch(self, command: dict) -> dict:
+        self.dispatch_calls.append(command)
+        if self.dispatch_error is not None:
+            raise self.dispatch_error
+        return {}
+
+    def thread_snapshot(self, thread_id: str) -> dict:
+        return {"thread": {}}
+
+
 def make_event(
     *,
     channel,
@@ -161,6 +182,15 @@ def make_env(tmp_path, monkeypatch):
             return None
 
         monkeypatch.setattr(app_mod.t3_mirror, "start", fake_mirror_start)
+
+        t3_registry: list[FakeT3Client] = []
+
+        class _RegisteringFakeT3Client(FakeT3Client):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                t3_registry.append(self)
+
+        monkeypatch.setattr(app_mod, "T3Client", _RegisteringFakeT3Client)
 
         pps_registry: list[FakePPS] = []
 
@@ -280,12 +310,14 @@ def make_env(tmp_path, monkeypatch):
 
         app = app_mod.build_app(settings)
         pps = pps_registry[-1]
+        t3 = t3_registry[-1] if t3_registry else None
 
         env = SimpleNamespace(
             settings=settings,
             app=app,
             handle=app.slackcc_handle,
             pps=pps,
+            t3=t3,
             backend_calls=backend_calls,
             backend_result=backend_result,
             backend_t3_calls=backend_t3_calls,
@@ -692,6 +724,65 @@ def test_handle_t3_registers_thread_in_mirror_before_dispatching_run_turn(make_e
     on_disk = json.loads(mirror_path.read_text())
     assert on_disk["threads"][call["thread_id"]]["channel"] == "Ct3"
     assert on_disk["threads"][call["thread_id"]]["thread_ts"] == "80.1"
+
+
+# --------------------------------------------------------------------------- #
+# handle(): Slack reply un-settles a T3 thread that was announced as settled
+# --------------------------------------------------------------------------- #
+
+
+def test_handle_t3_reply_unsettles_when_settled_notice_set(make_env):
+    env = make_env()
+    # Use the same MirrorStore instance build_app created (passed to t3_mirror.start).
+    mirror = env.mirror_start_calls[0][0][2]
+    thread_id = "slack-Ct3-90-1"
+    mirror.register(thread_id, "Ct3", "90.1")
+    mirror.set_settled_notice(thread_id, "2026-07-30T12:00:00Z")
+
+    call_handle(env, make_event(channel="Ct3", user="Uowner", ts="90.1",
+                                 text="unsettling reply"))
+
+    unsettle = [c for c in env.t3.dispatch_calls if c.get("type") == "thread.unsettle"]
+    assert len(unsettle) == 1
+    assert unsettle[0]["reason"] == "user"
+    assert unsettle[0]["threadId"] == thread_id
+    assert unsettle[0]["commandId"].startswith("slack-uns-")
+    assert mirror.settled_notice(thread_id) is None
+    assert len(env.backend_t3_calls) == 1
+
+
+def test_handle_t3_reply_skips_unsettle_when_not_settled(make_env):
+    env = make_env()
+    call_handle(env, make_event(channel="Ct3", user="Uowner", ts="90.2",
+                                 text="normal reply"))
+
+    unsettle = [c for c in env.t3.dispatch_calls if c.get("type") == "thread.unsettle"]
+    assert unsettle == []
+    assert len(env.backend_t3_calls) == 1
+
+
+# A malformed 200 body raises JSONDecodeError, and a socket timeout raises a bare
+# TimeoutError -- neither is a T3Error, and neither may strand the user's turn.
+@pytest.mark.parametrize("exc", [
+    T3Error("T3 POST /api/... -> 500: boom"),
+    ValueError("Expecting value: line 1 column 1 (char 0)"),
+    TimeoutError("timed out"),
+])
+def test_handle_t3_unsettle_dispatch_error_still_runs_turn_and_clears_notice(make_env, exc):
+    env = make_env()
+    mirror = env.mirror_start_calls[0][0][2]
+    thread_id = "slack-Ct3-90-3"
+    mirror.register(thread_id, "Ct3", "90.3")
+    mirror.set_settled_notice(thread_id, "2026-07-30T12:00:00Z")
+    env.t3.dispatch_error = exc
+
+    call_handle(env, make_event(channel="Ct3", user="Uowner", ts="90.3",
+                                 text="still go"))
+
+    unsettle = [c for c in env.t3.dispatch_calls if c.get("type") == "thread.unsettle"]
+    assert len(unsettle) == 1
+    assert mirror.settled_notice(thread_id) is None
+    assert len(env.backend_t3_calls) == 1
 
 
 # --------------------------------------------------------------------------- #
