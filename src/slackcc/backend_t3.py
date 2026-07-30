@@ -11,6 +11,10 @@ Completion detection: poll the thread snapshot until `latestTurn` (requested at
 or after our dispatch) reaches a terminal state, then read the message named by
 `latestTurn.assistantMessageId`. On timeout we dispatch `thread.turn.interrupt`
 so the turn doesn't keep running headless.
+
+While the turn is still running, the same polls feed `on_progress` with a
+summary of the in-flight work (newest narration segment + newest tool call),
+which the caller can surface (e.g. by editing the Slack placeholder).
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ import logging
 import time
 import uuid
 from datetime import datetime, timezone
+from typing import Callable
 
 from .backend import TurnResult
 from .t3 import MirrorStore, T3Client, T3Error
@@ -27,6 +32,38 @@ log = logging.getLogger(__name__)
 
 _POLL_SECS = 2.5
 _TERMINAL = {"completed", "interrupted", "error"}
+_PROGRESS_MIN_SECS = 5.0  # floor between on_progress emissions (Slack edit budget)
+_NARRATION_CLIP = 600
+_TOOL_CLIP = 200
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _progress_summary(thread: dict, turn_id: str | None) -> str:
+    """What the T3 GUI shows live, flattened for a Slack placeholder edit:
+    this turn's newest narration segment plus its newest tool call."""
+    if not turn_id:
+        return ""
+    narration = ""
+    for msg in thread.get("messages", []):
+        if msg.get("role") == "assistant" and msg.get("turnId") == turn_id:
+            text = (msg.get("text") or "").strip()
+            if text:
+                narration = text
+    tool = ""
+    for act in thread.get("activities", []):
+        if act.get("tone") == "tool" and act.get("turnId") == turn_id:
+            summary = (act.get("summary") or "").strip()
+            if summary:
+                tool = summary
+    parts = []
+    if narration:
+        parts.append(_clip(narration, _NARRATION_CLIP))
+    if tool:
+        parts.append(f"`{_clip(tool, _TOOL_CLIP)}`")
+    return "\n".join(parts)
 
 
 def _now_iso() -> str:
@@ -57,6 +94,7 @@ def run_turn(
     mirror: MirrorStore,
     timeout: int = 300,
     runtime_mode: str = "full-access",
+    on_progress: Callable[[str], None] | None = None,
 ) -> TurnResult:
     dispatched_at = _now_iso()
     message_id = f"slack-user-{uuid.uuid4()}"
@@ -111,6 +149,8 @@ def run_turn(
         return TurnResult(ok=False, text="", error=str(exc))
 
     deadline = time.monotonic() + timeout
+    last_progress = ""
+    last_progress_at = 0.0
     while time.monotonic() < deadline:
         time.sleep(_POLL_SECS)
         try:
@@ -123,6 +163,18 @@ def run_turn(
         if not turn or turn.get("requestedAt", "") < dispatched_at:
             continue
         if turn.get("state") not in _TERMINAL:
+            # Mid-turn: surface what the agent is doing right now. The polls
+            # already carry it; emit only on change, at a bounded rate.
+            if on_progress is not None:
+                summary = _progress_summary(thread, turn.get("turnId"))
+                now = time.monotonic()
+                if (summary and summary != last_progress
+                        and now - last_progress_at >= _PROGRESS_MIN_SECS):
+                    last_progress, last_progress_at = summary, now
+                    try:
+                        on_progress(summary)
+                    except Exception:  # noqa: BLE001 - progress must not kill the turn
+                        log.warning("progress callback failed", exc_info=True)
             continue
 
         assistant_id = turn.get("assistantMessageId")

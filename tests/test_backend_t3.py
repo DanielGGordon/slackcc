@@ -71,6 +71,33 @@ def completed_snapshot(assistant_id="assist-1", requested_at=FRESH_TS, messages=
 
 def fast_poll(monkeypatch):
     monkeypatch.setattr(backend_t3, "_POLL_SECS", 0.01)
+    monkeypatch.setattr(backend_t3, "_PROGRESS_MIN_SECS", 0.0)
+
+
+def running_snapshot(turn_id="turn-1", narration=None, tool=None):
+    """A mid-turn snapshot: latestTurn still running, with optional narration
+    segments (assistant messages) and tool activities attributed to the turn."""
+    messages = [{"id": "user-1", "role": "user", "turnId": turn_id,
+                 "streaming": False, "text": "the inbound prompt"}]
+    for i, text in enumerate(narration or []):
+        messages.append({"id": f"assist-seg-{i}", "role": "assistant",
+                         "turnId": turn_id, "streaming": True, "text": text})
+    activities = [
+        {"id": f"act-{i}", "tone": "tool", "turnId": turn_id, "summary": s}
+        for i, s in enumerate(tool or [])
+    ]
+    return {
+        "thread": {
+            "latestTurn": {
+                "turnId": turn_id,
+                "state": "running",
+                "requestedAt": FRESH_TS,
+                "assistantMessageId": None,
+            },
+            "messages": messages,
+            "activities": activities,
+        }
+    }
 
 
 def test_user_message_is_ledgered_before_any_dispatch(tmp_path, monkeypatch):
@@ -315,6 +342,92 @@ def test_timeout_returns_not_ok_and_dispatches_interrupt(tmp_path, monkeypatch):
     assert result.ok is False
     assert "timed out" in result.error
     assert "thread.turn.interrupt" in client.dispatch_types()
+
+
+def test_progress_reports_latest_narration_and_tool_then_final_text(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    thread_id = "t3-thread-progress"
+    mirror = make_mirror(tmp_path, thread_id)
+    client = FakeT3Client(snapshots=[
+        running_snapshot(narration=["I'll start by exploring the frontend."],
+                         tool=["Bash: grep -n foo app.py"]),
+        running_snapshot(narration=["I'll start by exploring the frontend.",
+                                    "Now mirroring the validation rules."],
+                         tool=["Bash: grep -n foo app.py",
+                               "Read handler.py"]),
+        completed_snapshot(),
+    ])
+    updates: list[str] = []
+
+    result = run_turn(
+        prompt="hello",
+        thread_id=thread_id,
+        is_new=False,
+        project_id="proj-1",
+        model={},
+        title="t",
+        client=client,
+        mirror=mirror,
+        on_progress=updates.append,
+    )
+
+    assert result.ok is True
+    assert result.text == "hello from t3"
+    assert updates == [
+        "I'll start by exploring the frontend.\n`Bash: grep -n foo app.py`",
+        "Now mirroring the validation rules.\n`Read handler.py`",
+    ]
+
+
+def test_progress_not_re_emitted_when_snapshot_unchanged(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    thread_id = "t3-thread-progress-dedupe"
+    mirror = make_mirror(tmp_path, thread_id)
+    same = running_snapshot(narration=["thinking"], tool=["Bash: ls"])
+    client = FakeT3Client(snapshots=[same, same, same, completed_snapshot()])
+    updates: list[str] = []
+
+    run_turn(
+        prompt="hello",
+        thread_id=thread_id,
+        is_new=False,
+        project_id="proj-1",
+        model={},
+        title="t",
+        client=client,
+        mirror=mirror,
+        on_progress=updates.append,
+    )
+
+    assert updates == ["thinking\n`Bash: ls`"]
+
+
+def test_progress_callback_error_does_not_kill_the_turn(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    thread_id = "t3-thread-progress-raises"
+    mirror = make_mirror(tmp_path, thread_id)
+    client = FakeT3Client(snapshots=[
+        running_snapshot(narration=["thinking"]),
+        completed_snapshot(),
+    ])
+
+    def boom(_text: str) -> None:
+        raise RuntimeError("slack edit failed")
+
+    result = run_turn(
+        prompt="hello",
+        thread_id=thread_id,
+        is_new=False,
+        project_id="proj-1",
+        model={},
+        title="t",
+        client=client,
+        mirror=mirror,
+        on_progress=boom,
+    )
+
+    assert result.ok is True
+    assert result.text == "hello from t3"
 
 
 def test_runtime_mode_propagates_to_create_and_turn_start(tmp_path, monkeypatch):

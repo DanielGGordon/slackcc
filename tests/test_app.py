@@ -514,6 +514,27 @@ def test_handle_guest_pps_allow_dispatches_to_t3_with_approval_required(make_env
     assert "Uguest" in judged["policy"]
 
 
+def test_handle_t3_progress_callback_edits_placeholder_then_final_overwrites(make_env, monkeypatch):
+    env = make_env()
+
+    def run_turn_with_progress(**kwargs):
+        kwargs["on_progress"]("Exploring the frontend\n`Bash: grep -n foo`")
+        return TurnResult(ok=True, text="final answer", session_id="sess-t3-1")
+
+    monkeypatch.setattr(app_mod.backend_t3, "run_turn", run_turn_with_progress)
+    call_handle(env, make_event(channel="Ct3", user="Uowner", ts="10.9",
+                                 text="do the thing"))
+
+    assert len(env.client.chat_update_calls) == 2
+    progress, final = env.client.chat_update_calls
+    assert progress["ts"] == "placeholder-1"
+    assert ":hourglass_flowing_sand:" in progress["text"]
+    assert "Exploring the frontend" in progress["text"]
+    assert "`Bash: grep -n foo`" in progress["text"]
+    assert final["ts"] == "placeholder-1"
+    assert final["text"] == "final answer"
+
+
 def test_handle_owner_skips_pps_judge_and_gets_full_access(make_env):
     env = make_env()
     call_handle(env, make_event(channel="Ct3", user="Uowner", ts="10.4",
