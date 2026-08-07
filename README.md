@@ -19,6 +19,13 @@ Slack channel ──(Socket Mode)──> slackcc daemon ──┬──> backend
 - **Scoping:** the bot only reacts in channels listed in `config/channels.json`.
   Each channel maps to a project (`cwd` + persona for the `claude` backend, or a
   T3 project id for the `t3` backend).
+- **Mention gating (opt-in, `require_mention`):** by default a configured
+  channel is the "works without me" loop -- every plain message gets a reply,
+  autonomously. Set `require_mention: true` on a channel that's ALSO used for
+  unrelated conversation (e.g. a channel that doubles as general chat) and the
+  bot stays silent on a plain message unless it's actually @-mentioned; once it
+  has replied in a thread, further replies in that same thread keep working
+  without re-tagging every time.
 - **Sender permissions** (`config/senders.json`): owners run full-access;
   everyone else is a guest — messages are screened by pps, the Prompt
   Protection Service (a local sandboxed LLM judge, blocking,
@@ -84,6 +91,8 @@ cp config/senders.example.json config/senders.json     # owner + guest permissio
 Edit `config/channels.json` — set the real channel id and either the T3 project
 id (`backend: "t3"`) or the project `cwd` + `persona` + `allowed_tools`
 (`backend: "claude"`; keep it least-privilege for friend-facing channels).
+Add `"require_mention": true` if the channel is also used for unrelated chat
+and the bot should only speak up when tagged (see "Mention gating" above).
 Put your own Slack member id in `config/senders.json` as `role: "owner"` —
 everyone else defaults to a screened, approval-required guest.
 

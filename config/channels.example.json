@@ -17,6 +17,14 @@
       "allowed_tools": ["Read", "Glob", "Grep", "Bash(git log:*)", "Bash(git diff:*)", "Bash(git status:*)"],
       "permission_mode": "acceptEdits",
       "timeout": 600
+    },
+    "C0ZZZZZZZZZ": {
+      "_comment": "require_mention (default false): set true for a channel that's ALSO used for unrelated conversation. The bot then stays silent on plain messages unless it's actually @-mentioned (or the message is a reply in a thread it already joined) -- instead of replying to every message like the default 'works without me' loop.",
+      "project": "shared-channel-project",
+      "cwd": "/home/you/projects/shared-channel-project",
+      "backend": "t3",
+      "t3_project_id": "00000000-0000-0000-0000-000000000000",
+      "require_mention": true
     }
   }
 }

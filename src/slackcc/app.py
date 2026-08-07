@@ -126,6 +126,26 @@ def build_app(settings: Settings) -> App:
             return
         user = event.get("user", "unknown")
         thread_ts = event.get("thread_ts") or event["ts"]
+        resume = sessions.get(channel_id, thread_ts)
+
+        # Mention gating (opt-in per channel): a channel that's ALSO used for
+        # unrelated conversation (e.g. #shiurim -- Torah study, not just this
+        # project) shouldn't have the bot jump into every plain message the
+        # way the default "works without me" loop does. Only skip a genuine
+        # top-level, unaddressed message: once a thread has a resumed session
+        # (the bot already joined it), replies in that thread keep working
+        # without re-tagging every time. `type` is the event's own field, not
+        # a side effect of which app.event() decorator dispatched here; the
+        # literal-mention check is a defense-in-depth fallback in case Slack
+        # ever fires "message" (not "app_mention") for a real @-mention.
+        if cfg.require_mention and resume is None:
+            is_mention = (
+                event.get("type") == "app_mention" or f"<@{bot_user_id}>" in text
+            )
+            if not is_mention:
+                log.info("skip unaddressed message channel=%s thread=%s",
+                         channel_id, thread_ts)
+                return
 
         # An external Claude session may "own" this thread (running its own
         # send/wait outreach loop). Stay out of it to avoid double-replies.
@@ -145,7 +165,6 @@ def build_app(settings: Settings) -> App:
                 except Exception:  # noqa: BLE001 - a bad file shouldn't kill the turn
                     logger.warning("file download failed", exc_info=True)
 
-        resume = sessions.get(channel_id, thread_ts)
         sp = settings.sender_policy(user)
 
         # pps is the screen (below): an owner's message, or a guest's message
