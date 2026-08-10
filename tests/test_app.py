@@ -146,8 +146,9 @@ def make_event(
     client_msg_id=None,
     event_ts=None,
     files=None,
+    type="message",  # noqa: A002 - mirrors Slack's own event field name
 ):
-    ev: dict = {"channel": channel, "user": user, "text": text, "ts": ts}
+    ev: dict = {"channel": channel, "user": user, "text": text, "ts": ts, "type": type}
     if thread_ts is not None:
         ev["thread_ts"] = thread_ts
     if subtype is not None:
@@ -275,6 +276,12 @@ def make_env(tmp_path, monkeypatch):
                 channel_id="Cclaude", project="claudeproj", cwd=str(cwd),
                 backend="claude", permission_mode="bypassPermissions",
                 persona="You are Foo-bot, the friendly helper for #claudeproj.",
+            ),
+            "Cmention": ChannelConfig(
+                channel_id="Cmention", project="claudeproj", cwd=str(cwd),
+                backend="claude", permission_mode="bypassPermissions",
+                persona="You are Foo-bot, the friendly helper for #claudeproj.",
+                require_mention=True,
             ),
         }
         senders = {
@@ -968,6 +975,78 @@ def test_handle_t3_resume_never_pays_for_the_protocol(make_env):
     assert call["is_new"] is False
     assert call["thread_id"] == "existing-thread-id"
     assert call["prompt"] == f'{bridge_header("Ct3", "90.4")}\n\nhi again'
+
+
+# --------------------------------------------------------------------------- #
+# handle(): require_mention gating (opt-in per channel, e.g. #shiurim)
+#
+# Motivating incident: Dan posted an ordinary message in #shiurim (a channel
+# also used for unrelated, non-project conversation) with no @mention, and the
+# bot replied anyway -- because the default "works without me" loop treats
+# every plain message in a configured channel as a turn. require_mention=True
+# opts a channel out of that: stay silent unless actually addressed, but keep
+# conversing naturally once a thread is live.
+# --------------------------------------------------------------------------- #
+
+
+def test_handle_require_mention_skips_plain_message_with_no_prior_session(make_env):
+    env = make_env()
+    call_handle(env, make_event(channel="Cmention", user="Uowner",
+                                 text="just chatting, no mention", ts="200.1"))
+
+    assert env.say.calls == []
+    assert env.backend_calls == []
+    assert env.backend_t3_calls == []
+
+
+def test_handle_require_mention_responds_when_bot_literally_mentioned_in_text(make_env):
+    env = make_env()
+    call_handle(env, make_event(channel="Cmention", user="Uowner",
+                                 text=f"hey <@{BOT_USER_ID}> can you help",
+                                 ts="200.2"))
+
+    assert len(env.backend_calls) == 1
+
+
+def test_handle_require_mention_responds_to_app_mention_event_type(make_env):
+    env = make_env()
+    call_handle(env, make_event(channel="Cmention", user="Uowner",
+                                 text="help me", ts="200.3", type="app_mention"))
+
+    assert len(env.backend_calls) == 1
+
+
+def test_handle_require_mention_app_mention_responds_regardless_of_flag(make_env):
+    # Sanity: an app_mention always gets a response, on a channel WITHOUT the
+    # flag too -- require_mention only changes behavior for plain messages.
+    env = make_env()
+    call_handle(env, make_event(channel="Cclaude", user="Uowner",
+                                 text="help me", ts="200.4", type="app_mention"))
+
+    assert len(env.backend_calls) == 1
+
+
+def test_handle_require_mention_plain_message_continues_an_existing_thread(make_env):
+    # Once the bot has replied in a thread (a resumed session exists), plain
+    # follow-up messages in that same thread must NOT need re-tagging.
+    key = SessionStore.key("Cmention", "200.5")
+    env = make_env(presession={key: "already-existing-session"})
+
+    call_handle(env, make_event(channel="Cmention", user="Uowner",
+                                 text="no mention, just continuing", ts="200.5"))
+
+    assert len(env.backend_calls) == 1
+    assert env.backend_calls[0]["resume"] == "already-existing-session"
+
+
+def test_handle_require_mention_false_by_default_still_replies_to_plain_message(make_env):
+    # Default behavior (every other channel) must be completely unchanged: no
+    # mention needed, no prior session needed.
+    env = make_env()
+    call_handle(env, make_event(channel="Cclaude", user="Uowner",
+                                 text="no mention here either", ts="200.6"))
+
+    assert len(env.backend_calls) == 1
 
 
 def test_handle_t3_unscreened_guest_gets_the_guard_inline(make_env):

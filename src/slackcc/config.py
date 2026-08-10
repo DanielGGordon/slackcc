@@ -27,6 +27,12 @@ class ChannelConfig:
     t3_model: dict = field(
         default_factory=lambda: {"instanceId": "claudeAgent", "model": "claude-sonnet-5"}
     )
+    # Default False preserves the original "works without me" loop: any plain
+    # message in a configured channel gets a reply. Opt a channel in when it's
+    # shared with unrelated conversation (e.g. also used for non-project chat)
+    # and the bot should only speak up when actually @-mentioned or replying
+    # in a thread it already joined -- see app.py's handle() for the gating.
+    require_mention: bool = False
 
     def validate(self) -> None:
         if not Path(self.cwd).is_dir():
@@ -118,6 +124,7 @@ def load_channels(config_path: Path) -> dict[str, ChannelConfig]:
             t3_model=spec.get(
                 "t3_model", {"instanceId": "claudeAgent", "model": "claude-sonnet-5"}
             ),
+            require_mention=bool(spec.get("require_mention", False)),
         )
         cfg.validate()
         out[channel_id] = cfg

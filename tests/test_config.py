@@ -164,6 +164,27 @@ def test_load_channels_defaults(tmp_path):
     assert cfg.persona is None
     assert cfg.allowed_tools == []
     assert cfg.backend == "claude"
+    assert cfg.require_mention is False
+
+
+def test_load_channels_require_mention_true(tmp_path):
+    cwd_dir = tmp_path / "project"
+    cwd_dir.mkdir()
+    config_path = tmp_path / "channels.json"
+    _write_json(
+        config_path,
+        {
+            "channels": {
+                "C123": {
+                    "project": "myproj",
+                    "cwd": str(cwd_dir),
+                    "require_mention": True,
+                }
+            }
+        },
+    )
+    cfg = load_channels(config_path)["C123"]
+    assert cfg.require_mention is True
 
 
 # ---------------------------------------------------------------------------
