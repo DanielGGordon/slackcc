@@ -41,6 +41,10 @@ class TurnResult:
     text: str
     session_id: str | None = None
     error: str | None = None
+    # t3 backend only: the turn is parked on an owner approval / question in
+    # the T3 GUI and the bridge stopped holding the Slack thread for it. The
+    # turn is still running there; the mirror delivers its eventual reply.
+    awaiting_approval: bool = False
 
 
 def _build_options(

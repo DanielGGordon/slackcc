@@ -50,6 +50,9 @@ class FakeSlackClient:
         self.chat_postMessage_calls.append(kwargs)
         return {"ok": True, "ts": "9999.0001"}
 
+    def chat_getPermalink(self, **kwargs):
+        return {"ok": True, "permalink": f"https://slack.example/{kwargs['message_ts']}"}
+
 
 class FakeApp:
     """Stand-in for slack_bolt.App: only what build_app touches."""
@@ -310,6 +313,7 @@ def make_env(tmp_path, monkeypatch):
             t3_url="http://127.0.0.1:0",
             t3_token="t3-tok",
             t3_owner="Dan",
+            t3_gui_url="https://t3.example:7443",
             pps_url="http://127.0.0.1:0",
             senders=senders,
             guest_defaults=guest_defaults,
@@ -1061,3 +1065,55 @@ def test_handle_t3_unscreened_guest_gets_the_guard_inline(make_env):
     assert prompt.startswith(bridge_header("Ct3", "90.7"))
     assert SAFETY_PREAMBLE in prompt
     assert wrap_untrusted("slack", "Ulogger", "hi") in prompt
+
+
+# --------------------------------------------------------------------------- #
+# guest turns parked on an owner approval in the T3 GUI
+# --------------------------------------------------------------------------- #
+
+
+def test_handle_t3_approval_wait_dms_owners_with_links_and_passes_config(make_env, monkeypatch):
+    env = make_env()
+    env.pps.queue({"verdict": "allow", "category": None, "reason": ""})
+    seen: dict = {}
+
+    def run_turn_parked(**kwargs):
+        seen.update(kwargs)
+        kwargs["on_approval_wait"]([{
+            "kind": "approval.requested", "requestId": "req-1",
+            "requestKind": "command", "detail": "Bash: rm -rf build",
+        }])
+        return TurnResult(ok=True, text="done after approval", session_id="sess-t3-1")
+
+    monkeypatch.setattr(app_mod.backend_t3, "run_turn", run_turn_parked)
+    call_handle(env, make_event(channel="Ct3", user="Uguest", ts="10.5",
+                                 text="clean the build dir"))
+
+    # Wiring: the channel's approval budget + owner display name reach the backend.
+    assert seen["approval_timeout"] == 3600
+    assert seen["owner_name"] == "Dan"
+    # Exactly the owners get a DM (Ulogger is a guest), once, with both links.
+    dms = env.client.chat_postMessage_calls
+    assert [d["channel"] for d in dms] == ["Uowner"]
+    note = dms[0]["text"]
+    assert "Uguest" in note and "run a command" in note and "rm -rf build" in note
+    assert "https://t3.example:7443/primary/slack-Ct3-10-5" in note
+    assert "https://slack.example/10.5" in note
+    # The final reply still lands in the placeholder as usual.
+    assert env.client.chat_update_calls[-1]["text"] == "done after approval"
+
+
+def test_handle_t3_awaiting_approval_result_posts_friendly_hold_note(make_env):
+    env = make_env()
+    env.pps.queue({"verdict": "allow", "category": None, "reason": ""})
+    env.backend_t3_result["value"] = TurnResult(
+        ok=False, text="", session_id="sess-t3-1",
+        error="still waiting for approval after 3600s", awaiting_approval=True,
+    )
+    call_handle(env, make_event(channel="Ct3", user="Uguest", ts="10.6",
+                                 text="please change the title format"))
+
+    final = env.client.chat_update_calls[-1]["text"]
+    assert "I hit an error" not in final
+    assert "Dan's approval" in final
+    assert env.logger.errors == []  # a parked turn is not a failure

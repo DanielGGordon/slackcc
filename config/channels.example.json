@@ -1,5 +1,5 @@
 {
-  "_comment": "Map each Slack channel id to a project. The bot ONLY responds in channels listed here (scoping). Get a channel id by right-clicking the channel in Slack > View channel details, or from the URL. backend 't3' routes turns into a T3 Code project (1:1 channel<->project, persona lives in that project's CLAUDE.md); backend 'claude' (default) drives the Claude Agent SDK directly with the persona/tools below.",
+  "_comment": "Map each Slack channel id to a project. The bot ONLY responds in channels listed here (scoping). Get a channel id by right-clicking the channel in Slack > View channel details, or from the URL. backend 't3' routes turns into a T3 Code project (1:1 channel<->project, persona lives in that project's CLAUDE.md); backend 'claude' (default) drives the Claude Agent SDK directly with the persona/tools below. timeout = seconds of AGENT time per turn (pauses while a guest turn waits on your approval); approval_timeout = how long the bridge holds a Slack thread for that approval before letting go (T3 keeps waiting; default 3600).",
   "channels": {
     "C0XXXXXXXXX": {
       "project": "my-project",
@@ -7,7 +7,8 @@
       "backend": "t3",
       "t3_project_id": "00000000-0000-0000-0000-000000000000",
       "t3_model": {"instanceId": "claudeAgent", "model": "claude-sonnet-5"},
-      "timeout": 900
+      "timeout": 900,
+      "approval_timeout": 3600
     },
     "C0YYYYYYYYY": {
       "project": "another-project",

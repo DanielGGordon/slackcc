@@ -282,6 +282,35 @@ def build_app(settings: Settings) -> App:
                           f"{body}")[:3900],
                 )
 
+            # A guest turn can park on an owner approval in the T3 GUI. The
+            # placeholder already says so (via progress); also page the owners
+            # by DM once per request, with a link, so it doesn't sit unseen.
+            def approval_wait(requests: list[dict]) -> None:
+                what = "\n".join(
+                    f"• wants to {backend_t3.describe_request(r)}" for r in requests)
+                permalink = None
+                try:
+                    permalink = client.chat_getPermalink(
+                        channel=channel_id, message_ts=thread_ts).get("permalink")
+                except Exception:  # noqa: BLE001 - link is a nicety
+                    logger.warning("could not get slack permalink", exc_info=True)
+                gui = settings.t3_thread_url(thread_id)
+                links = " · ".join(filter(None, [
+                    f"<{gui}|Open in T3>" if gui else None,
+                    f"<{permalink}|Slack thread>" if permalink else None,
+                ]))
+                note = scrub(
+                    f":raised_hand: <@{user}> has a turn waiting for your approval "
+                    f"in #{cfg.project} (T3 thread `{thread_id}`):\n{what}"
+                    + (f"\n{links}" if links else "")
+                    + f"\nIt pauses for up to {cfg.approval_timeout // 60} min; "
+                      "approve or deny in the T3 GUI.")[0]
+                for owner_id in settings.owner_ids():
+                    try:
+                        client.chat_postMessage(channel=owner_id, text=note)
+                    except Exception:  # noqa: BLE001 - paging must not kill the turn
+                        logger.warning("approval DM to %s failed", owner_id, exc_info=True)
+
             result = backend_t3.run_turn(
                 prompt="\n\n".join(filter(None, [header, protocol, guard, prompt])),
                 thread_id=thread_id,
@@ -294,6 +323,9 @@ def build_app(settings: Settings) -> App:
                 timeout=cfg.timeout,
                 runtime_mode=sp.runtime_mode,
                 on_progress=progress,
+                on_approval_wait=approval_wait,
+                approval_timeout=cfg.approval_timeout,
+                owner_name=settings.t3_owner,
             )
         else:
             result = backend.run_turn(
@@ -313,6 +345,12 @@ def build_app(settings: Settings) -> App:
 
         if result.ok:
             final = result.text or "(no output)"
+        elif result.awaiting_approval:
+            logger.info("turn parked on approval; released: %s", result.error)
+            final = (f":raised_hand: This needs {settings.t3_owner}'s approval in T3 "
+                     f"before it can continue, and I've been waiting a while. I've "
+                     f"pinged {settings.t3_owner}; the reply will show up in this "
+                     "thread once it's approved.")
         else:
             logger.error("turn failed: %s", result.error)
             final = f":warning: I hit an error: {result.error}"
