@@ -165,6 +165,7 @@ def test_load_channels_defaults(tmp_path):
     assert cfg.allowed_tools == []
     assert cfg.backend == "claude"
     assert cfg.require_mention is False
+    assert cfg.approval_timeout == 3600
 
 
 def test_load_channels_require_mention_true(tmp_path):
@@ -462,3 +463,24 @@ def test_load_settings_t3_channel_with_t3_token_succeeds(tmp_path, monkeypatch):
     settings = load_settings()
     assert settings.t3_token == "t3-secret"
     assert settings.has_t3_channels() is True
+
+
+def test_load_channels_approval_timeout_override(tmp_path):
+    cwd_dir = tmp_path / "project"
+    cwd_dir.mkdir()
+    config_path = tmp_path / "channels.json"
+    _write_json(config_path, {"channels": {"C123": {
+        "project": "myproj", "cwd": str(cwd_dir), "approval_timeout": 120}}})
+    assert load_channels(config_path)["C123"].approval_timeout == 120
+
+
+def test_owner_ids_and_t3_thread_url(tmp_path):
+    owner = SenderPolicy(user_id="U1", name="Dan", role="owner")
+    guest = SenderPolicy(user_id="U2", name="Guest", role="guest")
+    settings = _make_settings(tmp_path, senders={"U1": owner, "U2": guest})
+    assert settings.owner_ids() == ["U1"]
+    # No GUI base configured -> no link (loopback t3_url is useless in a DM).
+    assert settings.t3_thread_url("slack-C1-1-2") is None
+    from dataclasses import replace
+    with_gui = replace(settings, t3_gui_url="https://host:7443/")
+    assert with_gui.t3_thread_url("slack-C1-1-2") == "https://host:7443/primary/slack-C1-1-2"

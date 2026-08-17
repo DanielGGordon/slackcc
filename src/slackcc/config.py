@@ -19,6 +19,11 @@ class ChannelConfig:
     allowed_tools: list[str] = field(default_factory=list)
     permission_mode: str = "acceptEdits"
     timeout: int = 600  # seconds per turn; raise for channels that render/produce files
+    # t3 backend: how long a guest turn may sit parked on an owner approval /
+    # question in the T3 GUI before the bridge stops holding the Slack thread
+    # (the T3 turn keeps waiting; the mirror delivers a late reply). The
+    # `timeout` clock above pauses while parked, so it only counts agent time.
+    approval_timeout: int = 3600
     # backend "t3" routes turns into T3 Code (1:1 Slack channel <-> T3 project).
     # persona/allowed_tools/permission_mode are NOT applied on that path: the
     # persona lives in the project's CLAUDE.md and T3 runs full-access (beta).
@@ -69,6 +74,9 @@ class Settings:
     t3_url: str = "http://127.0.0.1:3773"
     t3_token: str | None = None
     t3_owner: str = "Dan"  # display name for GUI-typed messages mirrored to Slack
+    # Browser-reachable T3 GUI base (e.g. https://host:7443) for links in
+    # approval pings; the loopback t3_url is useless in a phone notification.
+    t3_gui_url: str | None = None
     pps_url: str = "http://127.0.0.1:8642"
     senders: dict[str, SenderPolicy] = field(default_factory=dict)
     guest_defaults: SenderPolicy | None = None
@@ -78,6 +86,15 @@ class Settings:
 
     def has_t3_channels(self) -> bool:
         return any(c.backend == "t3" for c in self.channels.values())
+
+    def owner_ids(self) -> list[str]:
+        """Slack member ids of role=owner senders -- who gets paged when a guest
+        turn parks on an approval. Empty without a senders.json (no guests then)."""
+        return [uid for uid, sp in self.senders.items() if sp.role == "owner"]
+
+    def t3_thread_url(self, thread_id: str) -> str | None:
+        base = (self.t3_gui_url or "").rstrip("/")
+        return f"{base}/primary/{thread_id}" if base else None
 
     def sender_policy(self, user_id: str) -> SenderPolicy:
         """Known senders get their entry; unknown senders get guest defaults.
@@ -119,6 +136,7 @@ def load_channels(config_path: Path) -> dict[str, ChannelConfig]:
             allowed_tools=list(spec.get("allowed_tools", [])),
             permission_mode=spec.get("permission_mode", "acceptEdits"),
             timeout=int(spec.get("timeout", 600)),
+            approval_timeout=int(spec.get("approval_timeout", 3600)),
             backend=spec.get("backend", "claude"),
             t3_project_id=spec.get("t3_project_id"),
             t3_model=spec.get(
@@ -177,6 +195,7 @@ def load_settings() -> Settings:
         t3_url=os.environ.get("SLACKCC_T3_URL", "http://127.0.0.1:3773"),
         t3_token=os.environ.get("SLACKCC_T3_TOKEN"),
         t3_owner=os.environ.get("SLACKCC_T3_OWNER", "Dan"),
+        t3_gui_url=os.environ.get("SLACKCC_T3_GUI_URL") or None,
         pps_url=os.environ.get("SLACKCC_PPS_URL", "http://127.0.0.1:8642"),
         senders=senders,
         guest_defaults=guest_defaults,

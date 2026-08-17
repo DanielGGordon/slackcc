@@ -33,6 +33,14 @@ Slack channel ──(Socket Mode)──> slackcc daemon ──┬──> backend
   for owner approval. A PreToolUse guard hook in each bridged project
   deterministically blocks mass deletion, secret-file reads, and env dumps
   regardless of what any model decides.
+- **Approval waits are visible, not fatal:** when a guest turn parks on an
+  approval (or an agent question) in the T3 GUI, the Slack placeholder says so,
+  every owner gets one DM per request with "Open in T3" / thread links (set
+  `SLACKCC_T3_GUI_URL`), and the per-turn `timeout` clock pauses -- it only
+  counts the agent's own time. If nobody acts within the channel's
+  `approval_timeout` (default 3600s) the bridge posts a "waiting for approval"
+  note and lets go of the thread *without* interrupting the T3 turn, so it can
+  still be approved later; the mirror delivers the eventual reply.
 - **Bidirectional mirror (t3 backend):** messages typed into the T3 GUI on a
   Slack-originated thread are posted back into the Slack thread
   ("_Owner said to the agent:_ …"), and replies land in both places. Settling
@@ -137,7 +145,7 @@ That costs tokens once per thread rather than never.
 ## Testing
 
 ```bash
-.venv/bin/python -m pytest tests/          # offline suite: 204 hermetic tests, ~6s
+.venv/bin/python -m pytest tests/          # offline suite: 242 hermetic tests, ~7s
 .venv/bin/python -m pytest tests/ -m live  # + judge-quality tier: real inference
                                            #   against the running pps/guard LLM (~20s)
 ```

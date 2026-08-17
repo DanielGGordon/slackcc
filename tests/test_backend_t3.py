@@ -452,3 +452,133 @@ def test_runtime_mode_propagates_to_create_and_turn_start(tmp_path, monkeypatch)
     turn_start_cmd = next(c for k, c in client.calls if k == "dispatch" and c["type"] == "thread.turn.start")
     assert create_cmd["runtimeMode"] == "approval-required"
     assert turn_start_cmd["runtimeMode"] == "approval-required"
+
+
+# --- approval-required turns parked on a human in the T3 GUI --------------
+
+
+def parked_snapshot(turn_id="turn-1", request_id="req-1", resolved=False,
+                    kind="approval.requested", detail="Bash: rm -rf build"):
+    """A running turn whose newest activity is an approval (or user-input)
+    request; `resolved=True` appends the matching resolution."""
+    snap = running_snapshot(turn_id=turn_id, narration=["Let me clean up."])
+    resolved_kind = backend_t3._BLOCKING_KINDS[kind]
+    payload = ({"requestId": request_id, "questions": [{"question": "Which one?"}]}
+               if kind == "user-input.requested"
+               else {"requestId": request_id, "requestKind": "command", "detail": detail})
+    acts = snap["thread"]["activities"]
+    acts.append({"id": "a-req", "tone": "approval", "kind": kind, "turnId": turn_id,
+                 "summary": "Command approval requested", "payload": payload})
+    if resolved:
+        acts.append({"id": "a-res", "tone": "approval", "kind": resolved_kind,
+                     "turnId": turn_id, "summary": "Approval resolved",
+                     "payload": {"requestId": request_id, "decision": "accept"}})
+    return snap
+
+
+def test_pending_requests_tracks_open_minus_resolved():
+    thread = parked_snapshot()["thread"]
+    pending = backend_t3._pending_requests(thread, "turn-1")
+    assert [r["requestId"] for r in pending] == ["req-1"]
+    assert pending[0]["kind"] == "approval.requested"
+    assert backend_t3._pending_requests(parked_snapshot(resolved=True)["thread"], "turn-1") == []
+    # Requests from another turn don't count.
+    assert backend_t3._pending_requests(thread, "other-turn") == []
+
+
+def test_describe_request_labels_kinds():
+    assert backend_t3.describe_request(
+        {"kind": "approval.requested", "requestKind": "command", "detail": "Bash: ls"}
+    ) == "run a command: `Bash: ls`"
+    assert backend_t3.describe_request(
+        {"kind": "approval.requested", "requestKind": "file-change"}) == "change a file"
+    assert backend_t3.describe_request(
+        {"kind": "user-input.requested", "questions": [{"question": "Which one?"}]}
+    ) == "a question for you: Which one?"
+
+
+def test_pending_approval_pauses_turn_clock_and_pages_once(tmp_path, monkeypatch):
+    """The 900s-style turn timeout must not fire while T3 is waiting on the
+    owner: the parked polls extend the deadline, the owner is paged exactly
+    once per request, the placeholder says it's paused, and the turn completes
+    normally once approved."""
+    fast_poll(monkeypatch)
+    thread_id = "t3-thread-parked"
+    mirror = make_mirror(tmp_path, thread_id)
+    parked = parked_snapshot()
+    # ~40 parked polls at 0.01s each is well past a 0.2s turn timeout.
+    client = FakeT3Client(snapshots=[parked] * 40 + [parked_snapshot(resolved=True),
+                                                     completed_snapshot()])
+    paged: list[list[dict]] = []
+    updates: list[str] = []
+
+    result = run_turn(
+        prompt="hello", thread_id=thread_id, is_new=False, project_id="p",
+        model={}, title="t", client=client, mirror=mirror,
+        timeout=0.2, approval_timeout=60,
+        on_progress=updates.append, on_approval_wait=paged.append,
+        owner_name="Dan",
+    )
+
+    assert result.ok is True and result.text == "hello from t3"
+    assert "thread.turn.interrupt" not in client.dispatch_types()
+    assert len(paged) == 1 and paged[0][0]["requestId"] == "req-1"
+    assert any("waiting for Dan to approve run a command" in u for u in updates)
+    # After the approval clears, progress drops the paused line again.
+    assert "paused" not in updates[-1]
+
+
+def test_approval_timeout_releases_without_interrupting(tmp_path, monkeypatch):
+    """When the owner never acts, the bridge stops holding the Slack thread but
+    leaves the T3 turn (and its pending approval) alone so it can still be
+    approved later; the result is flagged awaiting_approval, not a generic error."""
+    fast_poll(monkeypatch)
+    thread_id = "t3-thread-parked-forever"
+    mirror = make_mirror(tmp_path, thread_id)
+    client = FakeT3Client(snapshots=[parked_snapshot()])
+
+    result = run_turn(
+        prompt="hello", thread_id=thread_id, is_new=False, project_id="p",
+        model={}, title="t", client=client, mirror=mirror,
+        timeout=0.1, approval_timeout=0.05,
+    )
+
+    assert result.ok is False
+    assert result.awaiting_approval is True
+    assert "waiting for approval" in result.error
+    assert "thread.turn.interrupt" not in client.dispatch_types()
+
+
+def test_user_input_request_counts_as_parked(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    thread_id = "t3-thread-question"
+    mirror = make_mirror(tmp_path, thread_id)
+    client = FakeT3Client(snapshots=[parked_snapshot(kind="user-input.requested")] * 5
+                          + [completed_snapshot()])
+    paged: list[list[dict]] = []
+
+    result = run_turn(
+        prompt="hello", thread_id=thread_id, is_new=False, project_id="p",
+        model={}, title="t", client=client, mirror=mirror,
+        timeout=5, on_approval_wait=paged.append,
+    )
+
+    assert result.ok is True
+    assert len(paged) == 1 and paged[0][0]["kind"] == "user-input.requested"
+
+
+def test_approval_wait_callback_error_does_not_kill_the_turn(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    thread_id = "t3-thread-parked-cb-error"
+    mirror = make_mirror(tmp_path, thread_id)
+    client = FakeT3Client(snapshots=[parked_snapshot(), completed_snapshot()])
+
+    def boom(_):
+        raise RuntimeError("slack down")
+
+    result = run_turn(
+        prompt="hello", thread_id=thread_id, is_new=False, project_id="p",
+        model={}, title="t", client=client, mirror=mirror,
+        timeout=5, on_approval_wait=boom,
+    )
+    assert result.ok is True
