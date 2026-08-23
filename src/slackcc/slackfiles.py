@@ -3,13 +3,28 @@
 Slack file URLs (`url_private`) require the bot token as a Bearer header and the
 `files:read` scope. Downloaded files land in the project's `.slack-incoming/`
 so the agent can Read them (Claude Code can read images and PDFs directly;
-audio needs a separate transcription step)."""
+audio needs a separate transcription step).
+
+`build_t3_attachment` additionally packages a downloaded image for T3's
+`thread.turn.start` `message.attachments`, so it shows up as a real inline
+attachment in the T3 GUI (and is handed to the model as image content) instead
+of just a file path in the prompt text. T3 has no separate upload endpoint --
+the whole image rides along as a base64 data URL in the dispatch payload, so
+only formats/sizes its Claude adapter accepts are worth encoding."""
 
 from __future__ import annotations
 
+import base64
+import mimetypes
 import os
 import urllib.request
 from pathlib import Path
+
+# Mirrors T3's PROVIDER_SEND_TURN_MAX_IMAGE_BYTES and the mime types its
+# ClaudeAdapter actually forwards to the model (packages/contracts/src/
+# orchestration.ts, apps/server/src/provider/Layers/ClaudeAdapter.ts).
+MAX_T3_IMAGE_BYTES = 10 * 1024 * 1024
+T3_SUPPORTED_IMAGE_MIME_TYPES = {"image/gif", "image/jpeg", "image/png", "image/webp"}
 
 
 def _safe_name(file_obj: dict) -> str:
@@ -28,3 +43,22 @@ def download_slack_file(file_obj: dict, dest_dir: Path, token: str) -> Path | No
     with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310 - trusted Slack URL
         dest.write_bytes(resp.read())
     return dest
+
+
+def build_t3_attachment(path: Path) -> dict | None:
+    """A downloaded file, packaged as a T3 `message.attachments` entry -- or
+    None if it's not an image type/size T3's Claude adapter will accept (it
+    still reaches the agent via the local-path note in the prompt text)."""
+    mime_type = mimetypes.guess_type(path.name)[0]
+    if mime_type not in T3_SUPPORTED_IMAGE_MIME_TYPES:
+        return None
+    data = path.read_bytes()
+    if not data or len(data) > MAX_T3_IMAGE_BYTES:
+        return None
+    return {
+        "type": "image",
+        "name": path.name,
+        "mimeType": mime_type,
+        "sizeBytes": len(data),
+        "dataUrl": f"data:{mime_type};base64,{base64.b64encode(data).decode()}",
+    }

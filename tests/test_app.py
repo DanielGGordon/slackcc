@@ -846,6 +846,38 @@ def test_handle_guest_pps_judged_text_includes_attached_filenames(make_env):
     assert "[attached files: secret.pdf, plan.csv]" in judged
 
 
+def test_handle_t3_backend_attaches_downloaded_image_inline(make_env):
+    env = make_env()
+
+    def write_png(file_obj, dest_dir, token):
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        p = dest_dir / file_obj["name"]
+        p.write_bytes(b"fake-png-bytes")
+        return p
+
+    env.download_state["impl"] = write_png
+    files = [{"id": "F1", "name": "shot.png", "url_private": "https://files.slack.com/f1"}]
+    call_handle(env, make_event(channel="Ct3", user="Uowner", text="",
+                                 files=files, ts="60.5"))
+
+    assert len(env.backend_t3_calls) == 1
+    attachments = env.backend_t3_calls[0]["attachments"]
+    assert len(attachments) == 1
+    assert attachments[0]["type"] == "image"
+    assert attachments[0]["name"] == "shot.png"
+    assert attachments[0]["mimeType"] == "image/png"
+
+
+def test_handle_t3_backend_does_not_attach_non_image_files(make_env):
+    env = make_env()
+    files = [{"id": "F1", "name": "notes.txt", "url_private": "https://files.slack.com/f1"}]
+    call_handle(env, make_event(channel="Ct3", user="Uowner", text="",
+                                 files=files, ts="60.6"))
+
+    assert len(env.backend_t3_calls) == 1
+    assert env.backend_t3_calls[0]["attachments"] == []
+
+
 def test_handle_file_download_exception_does_not_kill_the_turn(make_env):
     env = make_env()
 

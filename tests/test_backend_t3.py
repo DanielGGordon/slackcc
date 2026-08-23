@@ -188,6 +188,51 @@ def test_thread_create_error_is_swallowed_and_turn_start_still_dispatched(tmp_pa
     assert result.ok is True
 
 
+def test_attachments_ride_along_on_turn_start_message(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    thread_id = "t3-thread-attachments"
+    mirror = make_mirror(tmp_path, thread_id)
+    client = FakeT3Client(snapshots=[completed_snapshot()])
+    attachment = {"type": "image", "name": "shot.png", "mimeType": "image/png",
+                  "sizeBytes": 3, "dataUrl": "data:image/png;base64,YWJj"}
+
+    run_turn(
+        prompt="hello",
+        thread_id=thread_id,
+        is_new=False,
+        project_id="proj-1",
+        model={},
+        title="t",
+        client=client,
+        mirror=mirror,
+        attachments=[attachment],
+    )
+
+    turn_start_cmd = next(c for k, c in client.calls if k == "dispatch" and c["type"] == "thread.turn.start")
+    assert turn_start_cmd["message"]["attachments"] == [attachment]
+
+
+def test_no_attachments_defaults_to_empty_list_on_turn_start_message(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    thread_id = "t3-thread-no-attachments"
+    mirror = make_mirror(tmp_path, thread_id)
+    client = FakeT3Client(snapshots=[completed_snapshot()])
+
+    run_turn(
+        prompt="hello",
+        thread_id=thread_id,
+        is_new=False,
+        project_id="proj-1",
+        model={},
+        title="t",
+        client=client,
+        mirror=mirror,
+    )
+
+    turn_start_cmd = next(c for k, c in client.calls if k == "dispatch" and c["type"] == "thread.turn.start")
+    assert turn_start_cmd["message"]["attachments"] == []
+
+
 def test_existing_thread_skips_thread_create(tmp_path, monkeypatch):
     fast_poll(monkeypatch)
     thread_id = "t3-thread-existing"

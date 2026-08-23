@@ -21,7 +21,7 @@ from .paths import claims_path
 from .pps import PPSClient
 from .sanitize import SAFETY_PREAMBLE, wrap_untrusted
 from .sessions import SessionStore
-from .slackfiles import download_slack_file
+from .slackfiles import build_t3_attachment, download_slack_file
 from .t3 import MirrorStore, T3Client
 
 log = logging.getLogger(__name__)
@@ -31,6 +31,9 @@ _IGNORED_SUBTYPES = {
     "bot_message", "message_changed", "message_deleted",
     "channel_join", "channel_leave", "thread_broadcast",
 }
+
+# T3's PROVIDER_SEND_TURN_MAX_ATTACHMENTS (packages/contracts/src/orchestration.ts).
+_MAX_T3_ATTACHMENTS = 8
 
 
 def bridge_header(channel_id: str, thread_ts: str) -> str:
@@ -244,6 +247,25 @@ def build_app(settings: Settings) -> App:
             # paying for the protocol inline on the first turn of the thread --
             # the agent gets it either way, just less cheaply.
             thread_id = resume or f"slack-{channel_id}-{thread_ts.replace('.', '-')}"
+
+            # Inline any downloaded images as real T3 attachments (T3 has no
+            # separate upload endpoint -- the bytes ride along as a base64
+            # data URL) so they render in the T3 GUI instead of only being a
+            # file-path note in the prompt text.
+            attachments: list[dict] = []
+            for p in local_paths:
+                try:
+                    att = build_t3_attachment(p)
+                except Exception:  # noqa: BLE001 - a bad attachment shouldn't kill the turn
+                    logger.warning("attachment encode failed for %s", p, exc_info=True)
+                    continue
+                if att is not None:
+                    attachments.append(att)
+            if len(attachments) > _MAX_T3_ATTACHMENTS:
+                logger.warning("dropping %d attachment(s) over T3's %d-per-message cap",
+                                len(attachments) - _MAX_T3_ATTACHMENTS, _MAX_T3_ATTACHMENTS)
+                attachments = attachments[:_MAX_T3_ATTACHMENTS]
+
             protocol = None
             if resume is None and not bridgedoc.is_installed(cfg.cwd):
                 log.warning("bridge protocol not in %s/CLAUDE.md; injecting inline. "
@@ -317,6 +339,7 @@ def build_app(settings: Settings) -> App:
                 is_new=resume is None,
                 project_id=cfg.t3_project_id or "",
                 model=cfg.t3_model,
+                attachments=attachments,
                 title=f"Slack: {(text or 'attachment')[:60]}",
                 client=t3_client,
                 mirror=mirror,
