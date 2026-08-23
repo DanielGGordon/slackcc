@@ -306,6 +306,52 @@ def test_download_slack_file_creates_dest_dir(tmp_path):
         assert (dest_dir / "z.txt").read_bytes() == b"x"
 
 
+def test_build_t3_attachment_encodes_supported_image_as_data_url(tmp_path):
+    import base64
+
+    p = tmp_path / "shot.png"
+    p.write_bytes(b"fake-png-bytes")
+
+    att = slackfiles.build_t3_attachment(p)
+
+    assert att == {
+        "type": "image",
+        "name": "shot.png",
+        "mimeType": "image/png",
+        "sizeBytes": len(b"fake-png-bytes"),
+        "dataUrl": f"data:image/png;base64,{base64.b64encode(b'fake-png-bytes').decode()}",
+    }
+
+
+def test_build_t3_attachment_returns_none_for_unsupported_mime_type(tmp_path):
+    p = tmp_path / "notes.txt"
+    p.write_text("plain text, not an image")
+
+    assert slackfiles.build_t3_attachment(p) is None
+
+
+def test_build_t3_attachment_returns_none_for_unknown_extension(tmp_path):
+    p = tmp_path / "mystery"
+    p.write_bytes(b"\x00\x01")
+
+    assert slackfiles.build_t3_attachment(p) is None
+
+
+def test_build_t3_attachment_returns_none_over_size_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(slackfiles, "MAX_T3_IMAGE_BYTES", 4)
+    p = tmp_path / "big.png"
+    p.write_bytes(b"way-too-big")
+
+    assert slackfiles.build_t3_attachment(p) is None
+
+
+def test_build_t3_attachment_returns_none_for_empty_file(tmp_path):
+    p = tmp_path / "empty.png"
+    p.write_bytes(b"")
+
+    assert slackfiles.build_t3_attachment(p) is None
+
+
 # --------------------------------------------------------------------------
 # paths
 # --------------------------------------------------------------------------

@@ -145,6 +145,7 @@ def run_turn(
     title: str,
     client: T3Client,
     mirror: MirrorStore,
+    attachments: list[dict] | None = None,
     timeout: int = 300,
     runtime_mode: str = "full-access",
     on_progress: Callable[[str], None] | None = None,
@@ -166,7 +167,7 @@ def run_turn(
             "messageId": message_id,
             "role": "user",
             "text": prompt,
-            "attachments": [],
+            "attachments": attachments or [],
         },
         # Owner gets full-access (bypass); guests get approval-required so
         # risky tool calls wait for approval in the T3 GUI (see senders.json).
