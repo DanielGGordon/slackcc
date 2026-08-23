@@ -1,5 +1,5 @@
 {
-  "_comment": "Per-sender permissions. Known senders listed here; anyone else gets guest_defaults (approval-required T3 runtime mode + blocking pps screen, fail-closed). Delete this file to turn protection off entirely (everyone owner, pre-pps behavior). pps_mode: skip | log | enforce. Find a user's id: click their profile in Slack > three dots > Copy member ID.",
+  "_comment": "Per-sender permissions. Known senders listed here; anyone else gets guest_defaults (approval-required T3 runtime mode + blocking pps screen, fail-closed). When pps declines a guest message the bot @-mentions every owner in the thread; an owner replying a bare Yes/No permits or keeps the denial. Delete this file to turn protection off entirely (everyone owner, pre-pps behavior). pps_mode: skip | log | enforce. Find a user's id: click their profile in Slack > three dots > Copy member ID.",
   "senders": {
     "U0XXXXXXXXX": {
       "name": "YourName",

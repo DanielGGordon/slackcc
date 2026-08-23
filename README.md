@@ -41,6 +41,23 @@ Slack channel ──(Socket Mode)──> slackcc daemon ──┬──> backend
   `approval_timeout` (default 3600s) the bridge posts a "waiting for approval"
   note and lets go of the thread *without* interrupting the T3 turn, so it can
   still be approved later; the mirror delivers the eventual reply.
+- **Owner override for screened messages:** when pps declines a guest's
+  message (`enforce` mode), the bot posts the denial and then asks the owners
+  in the same thread, quoting the request so it's unambiguous what a "yes"
+  unlocks -- `@owner This prompt was determined to be off topic by the safety
+  screen (category: reason): > "<first 200 chars>" Do you permit the AI to
+  work on this request? *Yes/No*`. An owner replying with a bare **yes** (or
+  no) in that thread settles it: *no* leaves it declined; *yes* replays the
+  guest's original message (their id, text, files) through the normal path
+  with the judge skipped for that one message only, so attribution and the
+  guest's `runtime_mode` still apply. Scope is per thread, one open question
+  at a time: a newer denial replaces it and the ask says so ("a *yes* applies
+  to this request only"); an unanswered question expires after 24h. Only
+  owners' whole-message answers count -- a guest typing "yes", or an owner
+  chatting normally, is handled as usual. Later guest messages in the thread
+  are still judged, but the judge sees the granted request as fenced,
+  data-only context, so plain follow-ups to it pass while unrelated asks are
+  still declined. State: `.state/pps_overrides.json`.
 - **Bidirectional mirror (t3 backend):** messages typed into the T3 GUI on a
   Slack-originated thread are posted back into the Slack thread
   ("_Owner said to the agent:_ …"), and replies land in both places. Settling
@@ -178,11 +195,13 @@ src/slackcc/
   outbound.py   secret scrubbing for everything posted to Slack
   config.py     env + channels.json + senders.json loading, per-sender policy
   sessions.py   thread -> session/thread id store (resume continuity)
+  overrides.py  owner yes/no override of pps denials (pending asks + grants)
   sanitize.py   fencing for the messages pps didn't gate
   bridgedoc.py  ships/renders/installs the bridge protocol
   data/slack-bridge.md   the protocol itself (package data)
   send_cli.py   `slack-send` outbound CLI
 config/channels.example.json
 config/senders.example.json
+.state/pps_overrides.json   per-thread pending owner asks + granted requests
 BACKLOG.md
 ```
