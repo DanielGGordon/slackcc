@@ -111,3 +111,75 @@ def test_is_installed_false_for_unrelated_claude_md(tmp_path):
 
 def test_is_installed_false_for_missing_dir(tmp_path):
     assert bridgedoc.is_installed(tmp_path / "nope") is False
+
+
+# --------------------------------------------------------------------------- #
+# is_current(): a stale section counts as not installed for the daemon
+# --------------------------------------------------------------------------- #
+
+
+def test_is_current_true_right_after_install(tmp_path):
+    bridgedoc.install(tmp_path)
+
+    assert bridgedoc.is_current(tmp_path) is True
+
+
+def test_is_current_false_when_section_body_is_from_an_older_release(tmp_path):
+    (tmp_path / "CLAUDE.md").write_text(
+        f"# Head\n\n{bridgedoc.MARK_BEGIN}\nOLD PROTOCOL\n{bridgedoc.MARK_END}\n"
+    )
+
+    assert bridgedoc.is_installed(tmp_path) is True  # install() would rewrite in place
+    assert bridgedoc.is_current(tmp_path) is False  # ...but the daemon can't trust it
+
+
+def test_is_current_false_for_a_truncated_section(tmp_path):
+    (tmp_path / "CLAUDE.md").write_text(
+        f"{bridgedoc.MARK_BEGIN}\n{bridgedoc.render()[:200]}\n"
+    )
+
+    assert bridgedoc.is_current(tmp_path) is False
+
+
+def test_is_current_false_when_missing(tmp_path):
+    assert bridgedoc.is_current(tmp_path) is False
+    (tmp_path / "CLAUDE.md").write_text("# unrelated\n")
+    assert bridgedoc.is_current(tmp_path) is False
+
+
+def test_reinstall_makes_a_stale_section_current_again(tmp_path):
+    (tmp_path / "CLAUDE.md").write_text(
+        f"{bridgedoc.MARK_BEGIN}\nOLD PROTOCOL\n{bridgedoc.MARK_END}\n"
+    )
+    assert bridgedoc.install(tmp_path) == "updated"
+
+    assert bridgedoc.is_current(tmp_path) is True
+
+
+def test_packaged_doc_describes_the_comment_header_not_the_old_line():
+    rendered = bridgedoc.render()
+
+    assert "<!-- slack channel=" in rendered
+    assert "[slack channel=" not in rendered
+
+
+def test_is_current_ignores_where_the_clis_were_resolved(tmp_path):
+    bridgedoc.install(tmp_path)
+    path = tmp_path / "CLAUDE.md"
+    other = path.read_text().replace(bridgedoc.cli_dir(), "/opt/elsewhere/slackcc/bin")
+    assert other != path.read_text()  # the doc really does bake the dir in
+    path.write_text(other)
+
+    # Same protocol text, different bin dir (daemon PATH vs operator shell).
+    assert bridgedoc.is_current(tmp_path) is True
+
+
+def test_is_current_still_catches_older_text_with_a_different_cli_dir(tmp_path):
+    bridgedoc.install(tmp_path)
+    path = tmp_path / "CLAUDE.md"
+    body = (path.read_text()
+            .replace(bridgedoc.cli_dir(), "/opt/elsewhere/bin")
+            .replace("### Replying", "### Replying (old)"))
+    path.write_text(body)
+
+    assert bridgedoc.is_current(tmp_path) is False

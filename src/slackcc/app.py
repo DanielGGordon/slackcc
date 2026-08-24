@@ -17,6 +17,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from . import backend, backend_t3, bridgedoc, t3_mirror
 from .claims import ClaimStore
 from .config import ChannelConfig, SenderPolicy, Settings
+from .names import NameResolver
 from .outbound import scrub
 from .overrides import OverrideStore, parse_yes_no
 from .paths import claims_path
@@ -41,9 +42,32 @@ _MAX_T3_ATTACHMENTS = 8
 def bridge_header(channel_id: str, thread_ts: str) -> str:
     """All a turn needs once the agent knows the protocol: which thread it is.
 
+    An HTML comment on purpose: the T3 GUI renders user messages through
+    react-markdown with rehype-raw + rehype-sanitize, which drops comments from
+    what the owner sees while the model still gets the raw text. So the ids the
+    outbound CLIs need ride along without a machine-looking line in the chat.
+    Same form on the claude backend (system prompt) so there's one format.
+
     The protocol itself comes from the system prompt (claude backend) or the
     project's CLAUDE.md (t3 backend) -- see bridgedoc.py."""
-    return f"[slack channel={channel_id} thread={thread_ts}]"
+    return f"<!-- slack channel={channel_id} thread={thread_ts} -->"
+
+
+def attribution(name: str, channel_name: str, text: str, *,
+                first_turn: bool, n_files: int = 0) -> str:
+    """The line the human reads in the T3 GUI: who said this, from where.
+
+    `name` and `channel_name` are daemon-resolved (names.py), never the user's
+    own text, so this sits outside any untrusted-content fence; `text` may
+    already be fenced. The channel label only appears on a thread's first turn
+    -- after that the thread itself says which project it is. Multi-line text
+    goes below the colon so the fence markers (or a pasted block) start on
+    their own line."""
+    who = f"{name} from #{channel_name}" if first_turn else name
+    if not text:
+        return f"{who} sent {n_files} file(s):"
+    sep = "\n" if "\n" in text else " "
+    return f"{who}:{sep}{text}"
 
 
 # Longest quoted grant text shown to the judge: enough to recognise the request,
@@ -147,6 +171,9 @@ def build_app(settings: Settings) -> App:
     # rather than going through paths.py like the shared claims file.
     overrides = OverrideStore(settings.sessions_path.parent / "pps_overrides.json")
     seen = _SeenSet()
+    # Configured sender names are reserved: an unconfigured Slack account
+    # whose profile says "Dan" is shown by id, not as the owner.
+    resolver = NameResolver(reserved={sp.name for sp in settings.senders.values()})
 
     auth = app.client.auth_test()
     bot_user_id = auth["user_id"]
@@ -253,9 +280,23 @@ def build_app(settings: Settings) -> App:
         persona = "\n\n".join(filter(
             None, [cfg.persona, bridgedoc.render(), header, guard]))
 
-        parts: list[str] = []
-        if text:
-            parts.append(text if screened else wrap_untrusted("slack", user, text))
+        # Attribution is what the owner sees in the T3 GUI (the routing ids
+        # are hidden in the header comment). It sits OUTSIDE the fence, so the
+        # fence must enclose every byte the sender controls: for an unscreened
+        # sender the label is built only from operator-configured strings
+        # (senders.json name or raw id, channels.json project) -- never from a
+        # Slack profile or channel name the sender could have edited. Screened
+        # senders (pps vouched, or the owner) get the resolved names.
+        if screened:
+            sender_name = resolver.sender(client, user, event, sp.name)
+            channel_name = resolver.channel(client, channel_id, cfg.project)
+        else:
+            sender_name, channel_name = sp.name, cfg.project
+        body = text if (screened or not text) else wrap_untrusted("slack", user, text)
+        parts: list[str] = [attribution(
+            sender_name, channel_name, body,
+            first_turn=resume is None, n_files=len(local_paths) or len(files),
+        )]
         if local_paths:
             listing = "\n".join(f"- {p}" for p in local_paths)
             parts.append(
@@ -348,9 +389,10 @@ def build_app(settings: Settings) -> App:
                 attachments = attachments[:_MAX_T3_ATTACHMENTS]
 
             protocol = None
-            if resume is None and not bridgedoc.is_installed(cfg.cwd):
-                log.warning("bridge protocol not in %s/CLAUDE.md; injecting inline. "
-                            "Run: slackcc init-project %s", cfg.cwd, cfg.cwd)
+            if resume is None and not bridgedoc.is_current(cfg.cwd):
+                log.warning("bridge protocol missing or out of date in %s/CLAUDE.md; "
+                            "injecting inline. Run: slackcc init-project %s",
+                            cfg.cwd, cfg.cwd)
                 protocol = bridgedoc.render()
             mirror.register(thread_id, channel_id, thread_ts)
 
@@ -421,7 +463,7 @@ def build_app(settings: Settings) -> App:
                 project_id=cfg.t3_project_id or "",
                 model=cfg.t3_model,
                 attachments=attachments,
-                title=f"Slack: {(text or 'attachment')[:60]}",
+                title=f"#{channel_name}: {' '.join((text or 'attachment').split())[:60]}",
                 client=t3_client,
                 mirror=mirror,
                 timeout=cfg.timeout,

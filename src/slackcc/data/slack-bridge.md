@@ -1,15 +1,22 @@
 ## Slack Bridge
 
 This project is bridged into Slack by the `slackcc` daemon. When a turn starts
-with a routing line like
+with a routing comment like
 
 ```
-[slack channel=C0123ABC thread=1780000000.000100]
+<!-- slack channel=C0123ABC thread=1780000000.000100 -->
 ```
 
-you are talking to a human in a Slack thread, and the rules below apply. That
-line is the entire per-turn overhead; `channel` and `thread` are the arguments
-the commands here need.
+you are talking to a human in a Slack thread, and the rules below apply. The
+comment is the entire per-turn overhead and is for you alone: the T3 GUI hides
+HTML comments, so the human reviewing the thread never sees it. `channel` and
+`thread` are the arguments the commands here need -- copy them from the comment
+exactly.
+
+The message itself is prefixed with who sent it and from which channel, e.g.
+`Berish Perlman from #sofer-ai: can you …` (later turns in the same thread drop
+the channel: `Berish Perlman: …`). That prefix is written by the daemon, not the
+user; the user's own words start after the colon.
 
 ### Replying
 

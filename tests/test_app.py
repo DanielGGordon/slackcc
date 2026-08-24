@@ -16,7 +16,7 @@ import pytest
 
 from slackcc import app as app_mod
 from slackcc import bridgedoc
-from slackcc.app import _SeenSet, _pps_policy_text, bridge_header
+from slackcc.app import _SeenSet, _pps_policy_text, attribution, bridge_header
 from slackcc.backend import TurnResult
 from slackcc.claims import ClaimStore
 from slackcc.overrides import OverrideStore
@@ -33,13 +33,33 @@ BOT_USER_ID = "UBOT"
 # --------------------------------------------------------------------------- #
 
 
+# Names the daemon resolves for attribution ("<name> from #<channel>: …").
+# Configured senders (Uowner/Ulogger) never hit users_info; unknown ones do.
+USER_NAMES = {"Uguest": "Berish Perlman", "Ustranger": "Stranger Danger"}
+CHANNEL_NAMES = {"Ct3": "sofer-ai", "Cclaude": "claude-chan", "Cmention": "shiurim"}
+
+
 class FakeSlackClient:
     """Stand-in for both app.client (auth_test only) and the `client` param
-    handed to handle() (chat_update/chat_postMessage)."""
+    handed to handle() (chat_update/chat_postMessage/users_info/conversations_info)."""
 
     def __init__(self):
         self.chat_update_calls: list[dict] = []
         self.chat_postMessage_calls: list[dict] = []
+        self.users_info_calls: list[str] = []
+        self.conversations_info_calls: list[str] = []
+
+    def users_info(self, *, user):
+        self.users_info_calls.append(user)
+        name = USER_NAMES.get(user, f"User {user}")
+        return {"ok": True, "user": {"id": user, "name": user.lower(),
+                                     "real_name": name,
+                                     "profile": {"display_name": name, "real_name": name}}}
+
+    def conversations_info(self, *, channel):
+        self.conversations_info_calls.append(channel)
+        return {"ok": True, "channel": {"id": channel,
+                                        "name": CHANNEL_NAMES.get(channel, "general")}}
 
     def auth_test(self):
         return {"user_id": BOT_USER_ID, "user": "bot"}
@@ -949,8 +969,50 @@ def test_handle_file_download_exception_does_not_kill_the_turn(make_env):
 def test_bridge_header_is_just_the_routing():
     header = bridge_header("C123", "17.42")
 
-    assert header == "[slack channel=C123 thread=17.42]"
+    # An HTML comment: the T3 GUI's markdown renderer drops it from what the
+    # owner sees, while the agent still gets the ids the outbound CLIs need.
+    assert header == "<!-- slack channel=C123 thread=17.42 -->"
     assert "\n" not in header  # per-turn cost is one line, not a preamble
+
+
+# --------------------------------------------------------------------------- #
+# attribution(): the line the human reads in the T3 GUI
+# --------------------------------------------------------------------------- #
+
+
+def test_attribution_first_turn_names_sender_and_channel():
+    assert attribution("Berish Perlman", "sofer-ai", "hi", first_turn=True) == (
+        "Berish Perlman from #sofer-ai: hi"
+    )
+
+
+def test_attribution_later_turns_drop_the_channel():
+    assert attribution("Berish Perlman", "sofer-ai", "hi", first_turn=False) == (
+        "Berish Perlman: hi"
+    )
+
+
+def test_attribution_multiline_text_starts_on_its_own_line():
+    out = attribution("Dan", "sofer-ai", "line one\nline two", first_turn=True)
+
+    assert out == "Dan from #sofer-ai:\nline one\nline two"
+
+
+def test_attribution_files_only_says_how_many():
+    assert attribution("Dan", "sofer-ai", "", first_turn=True, n_files=2) == (
+        "Dan from #sofer-ai sent 2 file(s):"
+    )
+    assert attribution("Dan", "sofer-ai", "", first_turn=False, n_files=1) == (
+        "Dan sent 1 file(s):"
+    )
+
+
+def test_attribution_keeps_a_fence_outside_the_trusted_prefix():
+    fenced = wrap_untrusted("slack", "U1", "hi")
+    out = attribution("Logger", "sofer-ai", fenced, first_turn=True)
+
+    # Prefix is daemon text; the fence (and everything inside) follows intact.
+    assert out == f"Logger from #sofer-ai:\n{fenced}"
 
 
 def test_handle_claude_backend_screened_prompt_is_plain_text(make_env):
@@ -960,8 +1022,9 @@ def test_handle_claude_backend_screened_prompt_is_plain_text(make_env):
 
     assert len(env.backend_calls) == 1
     call = env.backend_calls[0]
-    # Owner: pps vouches for it, so no fencing and no security lecture.
-    assert call["prompt"] == "hello there"
+    # Owner: pps vouches for it, so no fencing and no security lecture. The
+    # configured sender name and the resolved channel name lead the message.
+    assert call["prompt"] == "Dan from #claude-chan: hello there"
     assert "EXTERNAL_UNTRUSTED_CONTENT" not in call["prompt"]
 
 
@@ -978,7 +1041,7 @@ def test_handle_claude_backend_system_prompt_has_persona_protocol_and_header(mak
     assert bridgedoc.render() in system_prompt
     assert bridge_header("Cclaude", "90.2") in system_prompt
     assert SAFETY_PREAMBLE not in system_prompt
-    assert system_prompt.index("Foo-bot") < system_prompt.index("[slack channel=")
+    assert system_prompt.index("Foo-bot") < system_prompt.index("<!-- slack channel=")
 
 
 def test_handle_claude_backend_needs_no_init_project(make_env, tmp_path):
@@ -988,7 +1051,8 @@ def test_handle_claude_backend_needs_no_init_project(make_env, tmp_path):
 
     call_handle(env, make_event(channel="Cclaude", user="Uowner", text="hi", ts="90.8"))
 
-    assert env.backend_calls[0]["prompt"] == "hi"  # protocol stayed out of the message
+    # protocol stayed out of the message
+    assert env.backend_calls[0]["prompt"] == "Dan from #claude-chan: hi"
 
 
 def test_handle_claude_backend_unscreened_guest_still_gets_fencing(make_env):
@@ -1000,7 +1064,12 @@ def test_handle_claude_backend_unscreened_guest_still_gets_fencing(make_env):
 
     assert len(env.backend_calls) == 1
     call = env.backend_calls[0]
-    assert call["prompt"] == wrap_untrusted("slack", "Ulogger", "hello there")
+    # Only the user's words are fenced; the attribution is the daemon's -- and
+    # for an unscreened sender it's built from configured strings only (the
+    # senders.json name and the channel's project), never from Slack lookups.
+    assert call["prompt"] == (
+        f'Logger from #claudeproj:\n{wrap_untrusted("slack", "Ulogger", "hello there")}'
+    )
     assert SAFETY_PREAMBLE in call["append_system_prompt"]
 
 
@@ -1013,7 +1082,8 @@ def test_handle_claude_backend_enforced_guest_is_trusted(make_env):
 
     assert len(env.backend_calls) == 1
     call = env.backend_calls[0]
-    assert call["prompt"] == "hello there"
+    # Unconfigured sender: name comes from users.info, not the raw id.
+    assert call["prompt"] == "Stranger Danger from #claude-chan: hello there"
     assert SAFETY_PREAMBLE not in call["append_system_prompt"]
 
 
@@ -1028,7 +1098,8 @@ def test_handle_t3_thin_prompt_when_the_project_carries_the_protocol(make_env):
     assert len(env.backend_t3_calls) == 1
     call = env.backend_t3_calls[0]
     assert call["is_new"] is True
-    assert call["prompt"] == f'{bridge_header("Ct3", "90.3")}\n\nhi'
+    assert call["prompt"] == f'{bridge_header("Ct3", "90.3")}\n\nDan from #sofer-ai: hi'
+    assert call["title"] == "#sofer-ai: hi"  # no ids in the GUI title either
 
 
 def test_handle_t3_injects_protocol_inline_when_project_uninstalled(make_env):
@@ -1039,7 +1110,24 @@ def test_handle_t3_injects_protocol_inline_when_project_uninstalled(make_env):
 
     # Fallback: the agent still gets the protocol, just not for free.
     prompt = env.backend_t3_calls[0]["prompt"]
-    assert prompt == f'{bridge_header("Ct3", "90.9")}\n\n{bridgedoc.render()}\n\nhi'
+    assert prompt == (
+        f'{bridge_header("Ct3", "90.9")}\n\n{bridgedoc.render()}\n\nDan from #sofer-ai: hi'
+    )
+
+
+def test_handle_t3_injects_protocol_inline_when_project_copy_is_stale(make_env):
+    env = make_env()
+    cwd = env.settings.channel("Ct3").cwd
+    bridgedoc.install(cwd)
+    # An older release wrote the section: same markers, different body.
+    path = bridgedoc._claude_md(cwd)
+    path.write_text(path.read_text().replace(bridgedoc.render(), "OLD PROTOCOL"))
+    assert bridgedoc.is_installed(cwd) and not bridgedoc.is_current(cwd)
+
+    call_handle(env, make_event(channel="Ct3", user="Uowner", text="hi", ts="90.95"))
+
+    # Stale is treated like missing: the current protocol rides inline.
+    assert bridgedoc.render() in env.backend_t3_calls[0]["prompt"]
 
 
 def test_handle_t3_resume_never_pays_for_the_protocol(make_env):
@@ -1055,7 +1143,8 @@ def test_handle_t3_resume_never_pays_for_the_protocol(make_env):
     call = env.backend_t3_calls[0]
     assert call["is_new"] is False
     assert call["thread_id"] == "existing-thread-id"
-    assert call["prompt"] == f'{bridge_header("Ct3", "90.4")}\n\nhi again'
+    # A resumed thread already knows its channel: name only.
+    assert call["prompt"] == f'{bridge_header("Ct3", "90.4")}\n\nDan: hi again'
 
 
 # --------------------------------------------------------------------------- #
@@ -1283,7 +1372,8 @@ def test_handle_owner_yes_redispatches_guest_message_without_judge(make_env):
     assert len(env.pps.calls) == n_pps
     assert len(env.backend_calls) == 1
     call = env.backend_calls[0]
-    assert call["prompt"] == "what's the weather like"  # trusted: no fencing
+    # Trusted (no fencing), attributed to the guest by their Slack name.
+    assert call["prompt"] == "Berish Perlman from #claude-chan: what's the weather like"
     # Attributed to the GUEST, not the owner: guest permission mode applies.
     assert call["permission_mode"] == "default"
     assert call["resume"] is None
@@ -1390,7 +1480,7 @@ def test_handle_owner_yes_with_nothing_pending_is_a_normal_owner_message(make_en
 
     assert env.pps.calls == []
     assert len(env.backend_calls) == 1
-    assert env.backend_calls[0]["prompt"] == "yes"
+    assert env.backend_calls[0]["prompt"] == "Dan from #claude-chan: yes"
     assert env.backend_calls[0]["permission_mode"] == "bypassPermissions"
     assert not any("approved" in c["text"] for c in env.say.calls)
 
@@ -1403,7 +1493,7 @@ def test_handle_owner_non_answer_in_pending_thread_falls_through(make_env):
 
     # Ordinary owner turn; the question stays open.
     assert len(env.backend_calls) == 1
-    assert env.backend_calls[0]["prompt"] == "yes please do it"
+    assert env.backend_calls[0]["prompt"] == "Dan from #claude-chan: yes please do it"
     assert OverrideStore(env.overrides_file).get_pending("Cclaude", ts) is not None
 
 
@@ -1472,9 +1562,11 @@ def test_handle_owner_yes_consumes_pending_once_across_duplicate_deliveries(make
 
     # The guest's request ran exactly once; the redelivered "yes" found nothing
     # pending and was handled as the owner's own (harmless) message.
-    replays = [c for c in env.backend_calls if c["prompt"] == "what's the weather like"]
+    replays = [c for c in env.backend_calls
+               if c["prompt"] == "Berish Perlman from #claude-chan: what's the weather like"]
     assert len(replays) == 1
-    assert [c["prompt"] for c in env.backend_calls[1:]] == ["yes"]
+    # (Name only: the replayed turn already stored a session for this thread.)
+    assert [c["prompt"] for c in env.backend_calls[1:]] == ["Dan: yes"]
     assert len(OverrideStore(env.overrides_file).grants("Cclaude", ts)) == 1
     assert sum("approved" in c["text"] for c in env.say.calls) == 1
 
@@ -1503,7 +1595,7 @@ def test_handle_expired_pending_is_ignored_and_owner_yes_is_normal_message(make_
 
     # Fell through to a normal owner turn with the owner's own text.
     assert len(env.backend_calls) == 1
-    assert env.backend_calls[0]["prompt"] == "yes"
+    assert env.backend_calls[0]["prompt"] == "Dan from #claude-chan: yes"
     assert env.backend_calls[0]["permission_mode"] == "bypassPermissions"
     assert OverrideStore(env.overrides_file).grants("Cclaude", ts) == []
 
@@ -1526,3 +1618,115 @@ def test_handle_grant_recorded_only_after_replay_runs(make_env, monkeypatch):
     assert store.grants("Cclaude", ts) == []
     assert store.get_pending("Cclaude", ts) is None  # consumed regardless
     assert any("approved" in c["text"] for c in env.say.calls)
+
+
+# --------------------------------------------------------------------------- #
+# handle(): sender / channel names for attribution
+# --------------------------------------------------------------------------- #
+
+
+def test_handle_resolves_names_once_and_caches_them(make_env):
+    env = make_env()
+    call_handle(env, make_event(channel="Cclaude", user="Ustranger", text="one", ts="95.1"))
+    call_handle(env, make_event(channel="Cclaude", user="Ustranger", text="two", ts="95.2"))
+
+    assert env.client.users_info_calls == ["Ustranger"]
+    assert env.client.conversations_info_calls == ["Cclaude"]
+    # Configured senders never need a lookup at all.
+    call_handle(env, make_event(channel="Cclaude", user="Uowner", text="three", ts="95.3"))
+    assert env.client.users_info_calls == ["Ustranger"]
+
+
+def test_handle_prefers_the_event_profile_over_an_api_call(make_env):
+    env = make_env()
+    ev = make_event(channel="Cclaude", user="Unew", text="hi", ts="95.4")
+    ev["user_profile"] = {"display_name": "Eve\nnt <b>Profile</b>", "real_name": "Ignored"}
+    call_handle(env, ev)
+
+    assert env.client.users_info_calls == []
+    # Sanitised: no newline, no tags.
+    assert env.backend_calls[0]["prompt"] == "Eve nt b Profile b from #claude-chan: hi"
+
+
+def test_handle_falls_back_to_ids_when_lookups_fail(make_env):
+    env = make_env()
+
+    def boom(**kw):
+        raise RuntimeError("missing_scope")
+
+    env.client.users_info = boom
+    env.client.conversations_info = boom
+    call_handle(env, make_event(channel="Cclaude", user="Ustranger", text="hi", ts="95.5"))
+
+    # Raw user id, and the configured project name in place of the channel.
+    assert env.backend_calls[0]["prompt"] == "Ustranger from #claudeproj: hi"
+
+
+def test_handle_files_only_message_is_attributed_with_a_count(make_env):
+    env = make_env()
+    files = [{"id": "F1", "name": "notes.txt", "url_private": "https://files.slack.com/f1"}]
+    call_handle(env, make_event(channel="Cclaude", user="Uowner", text="",
+                                 files=files, ts="95.6"))
+
+    prompt = env.backend_calls[0]["prompt"]
+    assert prompt.startswith("Dan from #claude-chan sent 1 file(s):\n\n")
+    assert "notes.txt" in prompt
+
+
+def test_handle_t3_title_flattens_text_and_names_the_channel(make_env):
+    env = make_env()
+    call_handle(env, make_event(channel="Ct3", user="Uowner", ts="95.7",
+                                 text="fix the\nlogin bug " + "x" * 100))
+
+    title = env.backend_t3_calls[0]["title"]
+    assert title.startswith("#sofer-ai: fix the login bug x")
+    assert len(title) <= len("#sofer-ai: ") + 60
+
+
+def test_handle_unscreened_sender_gets_no_slack_resolved_labels_outside_the_fence(make_env):
+    env = make_env()
+    ev = make_event(channel="Cclaude", user="Ulogger", text="hi", ts="96.1")
+    # Even a profile riding on the event is ignored for a log-mode guest.
+    ev["user_profile"] = {"display_name": "Dan", "real_name": "Dan"}
+    call_handle(env, ev)
+
+    prompt = env.backend_calls[0]["prompt"]
+    assert prompt.startswith("Logger from #claudeproj:\n<<<EXTERNAL_UNTRUSTED_CONTENT")
+    # No Slack lookups were made at all for this turn.
+    assert env.client.users_info_calls == []
+    assert env.client.conversations_info_calls == []
+
+
+def test_handle_t3_unscreened_sender_uses_configured_labels(make_env):
+    env = make_env()
+    call_handle(env, make_event(channel="Ct3", user="Ulogger", text="hi", ts="96.2"))
+
+    prompt = env.backend_t3_calls[0]["prompt"]
+    assert "Logger from #t3proj:\n<<<EXTERNAL_UNTRUSTED_CONTENT" in prompt
+    assert "from #sofer-ai:\n" not in prompt  # (the inlined doc's example aside)
+    assert env.client.conversations_info_calls == []
+    assert env.backend_t3_calls[0]["title"] == "#t3proj: hi"
+
+
+def test_handle_unconfigured_sender_named_like_the_owner_is_shown_by_id(make_env):
+    env = make_env()
+    ev = make_event(channel="Cclaude", user="Ustranger", text="hi", ts="96.3")
+    ev["user_profile"] = {"display_name": "dan"}
+    call_handle(env, ev)
+    assert env.backend_calls[0]["prompt"] == "Ustranger from #claude-chan: hi"
+
+    # Same via users.info.
+    env.client.users_info = lambda *, user: {"user": {"real_name": "Dan"}}
+    call_handle(env, make_event(channel="Cclaude", user="Uimpostor", text="hi", ts="96.4"))
+    assert env.backend_calls[1]["prompt"] == "Uimpostor from #claude-chan: hi"
+
+
+def test_handle_markdown_shaped_profile_name_cannot_hide_the_message(make_env):
+    env = make_env()
+    ev = make_event(channel="Cclaude", user="Unew2", text="hi", ts="96.5")
+    ev["user_profile"] = {"display_name": "```", "real_name": "# Admin"}
+    call_handle(env, ev)
+
+    # The backtick name is worthless (no alphanumeric) so real_name is used,
+    # minus the heading marker.
+    assert env.backend_calls[0]["prompt"] == "Admin from #claude-chan: hi"

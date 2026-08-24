@@ -71,10 +71,15 @@ Slack channel ──(Socket Mode)──> slackcc daemon ──┬──> backend
   in `<<<EXTERNAL_UNTRUSTED_CONTENT>>>` markers plus the matching directive
   (`sanitize.py`).
 - **Bridge protocol lives outside the prompt:** each turn carries one routing
-  line (`[slack channel=… thread=…]`). How to reply, upload files, and post
-  extra messages ships with the package (`src/slackcc/data/slack-bridge.md`) and
-  reaches the agent through its system prompt (`claude` backend) or the
-  project's `CLAUDE.md` (`t3` backend — see step 4).
+  comment (`<!-- slack channel=… thread=… -->`) that the T3 GUI hides from the
+  reader, plus a human attribution line (`Berish Perlman from #sofer-ai: …`,
+  names resolved via `users.info`/`conversations.info` and cached). How to
+  reply, upload files, and post extra messages ships with the package
+  (`src/slackcc/data/slack-bridge.md`) and reaches the agent through its system
+  prompt (`claude` backend) or the project's `CLAUDE.md` (`t3` backend — see
+  step 4). A project whose `CLAUDE.md` copy is missing *or out of date* gets the
+  protocol injected inline on each thread's first turn (with a log warning)
+  until `slackcc init-project` is re-run.
 
 ## 1. Create the Slack app (one-time)
 
@@ -90,7 +95,11 @@ You need a **bot token** (`xoxb-`) and an **app-level token** (`xapp-`).
    - `app_mentions:read` — see @mentions
    - `channels:history` — read messages in public channels
    - `groups:history` — read messages in private channels (if you'll use one)
-   - `channels:read` — resolve channel info
+   - `channels:read` — resolve channel info (channel names for attribution)
+   - `groups:read` — same for private channels (`conversations.info` needs it;
+     without it the project name is used as the channel label)
+   - `users:read` — resolve sender display names for attribution (optional:
+     without it, unconfigured senders show as their Slack user id)
    *(For later: `files:read` for voice notes/attachments.)*
 4. **Event Subscriptions** (left sidebar) → **Enable Events**. (No Request URL
    needed — Socket Mode delivers events.) Under **Subscribe to bot events**, add:
