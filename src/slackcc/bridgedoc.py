@@ -18,6 +18,7 @@ the package, and the copy in a project's CLAUDE.md is written from it.
 
 from __future__ import annotations
 
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -55,17 +56,56 @@ def _claude_md(project_dir: Path | str) -> Path:
     return Path(project_dir) / "CLAUDE.md"
 
 
+def _installed_body(project_dir: Path | str) -> str | None:
+    """Text between the markers in this project's CLAUDE.md, or None if there's
+    no section (or no readable file). A truncated section (no end marker) reads
+    through to EOF, mirroring what install() would replace."""
+    path = _claude_md(project_dir)
+    try:
+        content = path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+    _, has_begin, rest = content.partition(MARK_BEGIN)
+    if not has_begin:
+        return None
+    body, _, _ = rest.partition(MARK_END)
+    return body
+
+
 def is_installed(project_dir: Path | str) -> bool:
     """Has the protocol been written into this project's CLAUDE.md?
 
     Only the begin marker is checked: a file that has it will be rewritten (not
     appended to) by install(), so a truncated section still counts as installed
     rather than silently duplicating."""
-    path = _claude_md(project_dir)
-    try:
-        return MARK_BEGIN in path.read_text()
-    except (OSError, UnicodeDecodeError):
-        return False
+    return _installed_body(project_dir) is not None
+
+
+# An absolute directory sitting in front of one of our CLIs, e.g. the
+# `/…/.venv/bin` that render() baked in. Masked back to the placeholder so two
+# installs that differ only in where `slack-send` lives compare equal.
+_CLI_DIR = re.compile(r"(?:/[^\s/`$()]+)+(?=/slack-(?:send|upload|wait-reply)\b)")
+
+
+def _normalise(text: str) -> str:
+    return _CLI_DIR.sub("{cli_dir}", text.strip())
+
+
+def is_current(project_dir: Path | str) -> bool:
+    """Is the installed section the protocol this package ships?
+
+    A project that ran `slackcc init-project` under an older release still has
+    that release's protocol in its CLAUDE.md (e.g. the old visible routing line
+    instead of the HTML comment). The daemon uses this, not is_installed(), to
+    decide whether the agent can be trusted to know the current protocol; a
+    stale copy is treated like a missing one until the operator re-runs
+    init-project.
+
+    The baked-in CLI directory is deliberately ignored: the daemon's PATH and
+    the operator's init-project shell may resolve `slack-send` differently, and
+    that must not make every project read as stale forever."""
+    body = _installed_body(project_dir)
+    return body is not None and _normalise(body) == _normalise(DOC_PATH.read_text())
 
 
 def install(project_dir: Path | str) -> str:
