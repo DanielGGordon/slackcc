@@ -100,7 +100,9 @@ You need a **bot token** (`xoxb-`) and an **app-level token** (`xapp-`).
      without it the project name is used as the channel label)
    - `users:read` — resolve sender display names for attribution (optional:
      without it, unconfigured senders show as their Slack user id)
-   *(For later: `files:read` for voice notes/attachments.)*
+   - `files:read` — download attachments a user sends so the agent can read
+     them (without it Slack answers file downloads with its HTML sign-in page)
+   - `files:write` — `slack-upload` (posting files the agent produced)
 4. **Event Subscriptions** (left sidebar) → **Enable Events**. (No Request URL
    needed — Socket Mode delivers events.) Under **Subscribe to bot events**, add:
    - `message.channels`, `message.groups`, `app_mention`

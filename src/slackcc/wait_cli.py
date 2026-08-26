@@ -9,6 +9,11 @@ Typical loop a Claude session runs:
     slack-send C123 "v2 ..." --thread "$ts"
     reply=$(slack-wait-reply C123 --thread "$ts" --after <last_ts>)
     ... until approved, then: slack-wait-reply ... --release  (frees the daemon)
+
+Attachments on that reply are downloaded here, exactly where the daemon would
+have put them, and reported as local paths in the JSON. The daemon never sees a
+claimed thread, so without this leg an image sent mid-loop would reach the agent
+as a caption with nothing behind it.
 """
 
 from __future__ import annotations
@@ -17,12 +22,14 @@ import argparse
 import json
 import sys
 import time
+from pathlib import Path
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 from .claims import ClaimStore
-from .paths import claims_path, resolve_token
+from .paths import channel_cwd, claims_path, resolve_token
+from .slackfiles import download_files, incoming_dir
 
 
 def main() -> int:
@@ -39,6 +46,9 @@ def main() -> int:
                    help="Claim the thread before waiting (daemon won't auto-reply in it)")
     p.add_argument("--release", action="store_true",
                    help="Release the claim once a reply arrives")
+    p.add_argument("--files-dir", default=None,
+                   help="Where to save attachments (default: the channel's "
+                        "project dir from channels.json, else the cwd)")
     args = p.parse_args()
 
     token = resolve_token()
@@ -72,9 +82,25 @@ def main() -> int:
         for msg in resp.get("messages", []):
             if float(msg.get("ts", 0)) <= after:
                 continue
-            if msg.get("user") == bot_id or msg.get("bot_id") or msg.get("subtype"):
-                continue  # skip our own posts and system messages
+            if msg.get("user") == bot_id or msg.get("bot_id"):
+                continue  # skip our own posts
+            # `file_share` IS a real human message -- an upload, usually with a
+            # caption. Every other subtype is a join/edit/system event.
+            if msg.get("subtype") not in (None, "file_share"):
+                continue
             out = {"ts": msg["ts"], "user": msg.get("user"), "text": msg.get("text", "")}
+            attached = msg.get("files") or []
+            if attached:
+                base = args.files_dir or channel_cwd(args.channel) or Path.cwd()
+                saved = download_files(
+                    attached, incoming_dir(base, args.thread_ts), token,
+                    on_error=lambda fo, e: print(
+                        f"warning: could not download {fo.get('name')!r}: {e}",
+                        file=sys.stderr),
+                )
+                # Paths, not bytes: the agent Reads them (Claude Code renders
+                # images and PDFs directly).
+                out["files"] = [{"name": f.name, "path": str(f)} for f in saved]
             if args.release:
                 claims.release(args.channel, args.thread_ts)
             print(json.dumps(out))

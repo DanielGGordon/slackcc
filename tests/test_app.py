@@ -16,6 +16,7 @@ import pytest
 
 from slackcc import app as app_mod
 from slackcc import bridgedoc
+from slackcc import slackfiles as slackfiles_mod
 from slackcc.app import _SeenSet, _pps_policy_text, attribution, bridge_header
 from slackcc.backend import TurnResult
 from slackcc.claims import ClaimStore
@@ -245,7 +246,10 @@ def make_env(tmp_path, monkeypatch):
             p.write_text("fake-downloaded-bytes")
             return p
 
-        monkeypatch.setattr(app_mod, "download_slack_file", fake_download_slack_file)
+        # Patched on slackfiles, not app: app.download_files() resolves it
+        # there at call time, and so does slack-wait-reply's copy of the leg.
+        monkeypatch.setattr(slackfiles_mod, "download_slack_file",
+                            fake_download_slack_file)
 
         backend_calls: list[dict] = []
         backend_result = {"value": TurnResult(ok=True, text="claude reply",

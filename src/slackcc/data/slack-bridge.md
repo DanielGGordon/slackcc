@@ -85,6 +85,17 @@ thread stays deaf to the daemon.
 Files a user attaches are downloaded before your turn starts and listed in the
 message as local paths under `.slack-incoming/<thread>/`. Read them directly.
 
+The same holds inside a claim loop: `slack-wait-reply` downloads whatever was
+attached to the reply and adds a `files` array to its JSON —
+
+```json
+{"ts": "1780…", "user": "U123", "text": "use this logo",
+ "files": [{"name": "logo.png", "path": "/abs/path/.slack-incoming/1780…/logo.png"}]}
+```
+
+Read those paths before you answer. An image sent mid-thread is on disk and
+readable like any other file — never tell the user you can't see it.
+
 ### Outbound scrubbing
 
 Everything posted to Slack is scanned on the way out and secret-shaped strings
