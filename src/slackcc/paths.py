@@ -6,6 +6,7 @@ package location instead."""
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -13,10 +14,31 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 STATE_DIR = Path(os.environ.get("SLACKCC_STATE_DIR", str(PROJECT_ROOT / ".state")))
 DOTENV = Path(os.environ.get("SLACKCC_DOTENV", str(PROJECT_ROOT / ".env")))
+# Same env var the daemon reads (config.load_settings), but anchored absolutely:
+# a CLI is invoked from whatever project the agent is working in, so the
+# daemon's "./config/channels.json" default would miss.
+CHANNELS_CONFIG = Path(
+    os.environ.get("SLACKCC_CONFIG", str(PROJECT_ROOT / "config" / "channels.json"))
+)
 
 
 def claims_path() -> Path:
     return STATE_DIR / "claimed.json"
+
+
+def channel_cwd(channel_id: str) -> Path | None:
+    """The project directory a channel routes to, read straight from the
+    routing map -- or None if the channel isn't configured (or the file is
+    unreadable). The CLIs need it to put inbound files exactly where the daemon
+    would, and they have no Settings: no tokens, no env, no bolt app."""
+    try:
+        raw = json.loads(CHANNELS_CONFIG.read_text())
+    except (OSError, ValueError):
+        return None
+    spec = (raw.get("channels") or {}).get(channel_id)
+    if not isinstance(spec, dict) or not spec.get("cwd"):
+        return None
+    return Path(os.path.expanduser(str(spec["cwd"])))
 
 
 def _parse_dotenv(path: Path) -> dict[str, str]:

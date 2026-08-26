@@ -29,6 +29,7 @@ def _make_handler(responder, requests_log):
     `requests_log` and delegates status/body decisions to `responder`.
 
     `responder(method, path, headers, body_bytes) -> (status_code, payload_bytes_or_None)`
+    A responder may return a third element to set the Content-Type header.
     """
 
     class Handler(BaseHTTPRequestHandler):
@@ -43,10 +44,12 @@ def _make_handler(responder, requests_log):
                     "body": body,
                 }
             )
-            status, payload = responder(self.command, self.path, dict(self.headers), body)
+            status, payload, *rest = responder(
+                self.command, self.path, dict(self.headers), body)
             self.send_response(status)
             if payload is not None:
-                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Type", rest[0] if rest
+                                 else "application/octet-stream")
             self.end_headers()
             if payload is not None:
                 self.wfile.write(payload)
@@ -306,6 +309,82 @@ def test_download_slack_file_creates_dest_dir(tmp_path):
         assert (dest_dir / "z.txt").read_bytes() == b"x"
 
 
+def test_download_slack_file_rejects_the_html_sign_in_page(tmp_path):
+    """No `files:read` scope -> Slack answers 200 with its login page. Saving
+    that as `photo.png` would only fail later, somewhere less obvious."""
+    def responder(method, path, headers, body):
+        return 200, b"<html>Sign in to Slack</html>", "text/html; charset=utf-8"
+
+    with _LocalServer(responder) as srv:
+        file_obj = {"name": "photo.png", "mimetype": "image/png",
+                    "url_private": f"{srv.url}/files/photo.png"}
+        with pytest.raises(slackfiles.SlackFileError, match="files:read"):
+            slackfiles.download_slack_file(file_obj, tmp_path, "tok")
+
+    assert not (tmp_path / "photo.png").exists()
+
+
+def test_download_slack_file_allows_html_when_the_file_really_is_html(tmp_path):
+    def responder(method, path, headers, body):
+        return 200, b"<html>real content</html>", "text/html"
+
+    with _LocalServer(responder) as srv:
+        file_obj = {"name": "page.html", "mimetype": "text/html",
+                    "url_private": f"{srv.url}/files/page.html"}
+        result = slackfiles.download_slack_file(file_obj, tmp_path, "tok")
+
+    assert result.read_bytes() == b"<html>real content</html>"
+
+
+def test_incoming_dir_is_one_directory_per_thread(tmp_path):
+    assert (slackfiles.incoming_dir(tmp_path, "1787678587.002349")
+            == tmp_path / ".slack-incoming" / "1787678587_002349")
+
+
+def test_download_files_returns_every_saved_path(tmp_path, monkeypatch):
+    saved = []
+
+    def fake(file_obj, dest_dir, token):
+        path = dest_dir / file_obj["name"]
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        path.write_text("bytes")
+        saved.append(token)
+        return path
+
+    monkeypatch.setattr(slackfiles, "download_slack_file", fake)
+    out = slackfiles.download_files(
+        [{"name": "a.png"}, {"name": "b.pdf"}], tmp_path, "tok")
+
+    assert [p.name for p in out] == ["a.png", "b.pdf"]
+    assert saved == ["tok", "tok"]
+
+
+def test_download_files_skips_the_broken_one_and_reports_it(tmp_path, monkeypatch):
+    """One unreadable attachment must not cost the agent the other one."""
+    def fake(file_obj, dest_dir, token):
+        if file_obj["name"] == "bad.png":
+            raise slackfiles.SlackFileError("nope")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        path = dest_dir / file_obj["name"]
+        path.write_text("bytes")
+        return path
+
+    errors = []
+    monkeypatch.setattr(slackfiles, "download_slack_file", fake)
+    out = slackfiles.download_files(
+        [{"name": "bad.png"}, {"name": "good.png"}], tmp_path, "tok",
+        on_error=lambda fo, e: errors.append((fo["name"], str(e))))
+
+    assert [p.name for p in out] == ["good.png"]
+    assert errors == [("bad.png", "nope")]
+
+
+def test_download_files_drops_entries_with_no_url(tmp_path, monkeypatch):
+    monkeypatch.setattr(slackfiles, "download_slack_file",
+                        lambda fo, d, t: None)
+    assert slackfiles.download_files([{"name": "a"}], tmp_path, "tok") == []
+
+
 def test_build_t3_attachment_encodes_supported_image_as_data_url(tmp_path):
     import base64
 
@@ -359,6 +438,39 @@ def test_build_t3_attachment_returns_none_for_empty_file(tmp_path):
 def test_claims_path_derives_from_state_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "STATE_DIR", tmp_path)
     assert paths.claims_path() == tmp_path / "claimed.json"
+
+
+def test_channel_cwd_reads_the_project_dir_from_the_routing_map(tmp_path, monkeypatch):
+    cfg = tmp_path / "channels.json"
+    cfg.write_text(json.dumps({"channels": {
+        "C123": {"project": "demo", "cwd": "~/projects/demo"},
+    }}))
+    monkeypatch.setattr(paths, "CHANNELS_CONFIG", cfg)
+    monkeypatch.setenv("HOME", "/home/tester")
+
+    assert paths.channel_cwd("C123") == Path("/home/tester/projects/demo")
+
+
+def test_channel_cwd_returns_none_for_unknown_or_unusable_entries(tmp_path, monkeypatch):
+    cfg = tmp_path / "channels.json"
+    cfg.write_text(json.dumps({"channels": {
+        "_comment": "not a channel", "C_NOCWD": {"project": "x"},
+    }}))
+    monkeypatch.setattr(paths, "CHANNELS_CONFIG", cfg)
+
+    assert paths.channel_cwd("C_MISSING") is None
+    assert paths.channel_cwd("_comment") is None
+    assert paths.channel_cwd("C_NOCWD") is None
+
+
+def test_channel_cwd_returns_none_when_the_config_is_missing_or_broken(tmp_path, monkeypatch):
+    monkeypatch.setattr(paths, "CHANNELS_CONFIG", tmp_path / "nope.json")
+    assert paths.channel_cwd("C123") is None
+
+    broken = tmp_path / "broken.json"
+    broken.write_text("{not json")
+    monkeypatch.setattr(paths, "CHANNELS_CONFIG", broken)
+    assert paths.channel_cwd("C123") is None
 
 
 def test_resolve_token_prefers_env_var(monkeypatch, tmp_path):

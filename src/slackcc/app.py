@@ -24,7 +24,7 @@ from .paths import claims_path
 from .pps import PPSClient
 from .sanitize import SAFETY_PREAMBLE, wrap_untrusted
 from .sessions import SessionStore
-from .slackfiles import build_t3_attachment, download_slack_file
+from .slackfiles import build_t3_attachment, download_files, incoming_dir
 from .t3 import MirrorStore, T3Client
 
 log = logging.getLogger(__name__)
@@ -256,14 +256,11 @@ def build_app(settings: Settings) -> App:
         # Inbound files: download so the agent can Read them.
         local_paths: list[Path] = []
         if files:
-            incoming = Path(cfg.cwd) / ".slack-incoming" / thread_ts.replace(".", "_")
-            for fo in files:
-                try:
-                    p = download_slack_file(fo, incoming, settings.bot_token)
-                    if p:
-                        local_paths.append(p)
-                except Exception:  # noqa: BLE001 - a bad file shouldn't kill the turn
-                    logger.warning("file download failed", exc_info=True)
+            local_paths = download_files(
+                files, incoming_dir(cfg.cwd, thread_ts), settings.bot_token,
+                on_error=lambda fo, e: logger.warning(
+                    "file download failed (%s): %s", fo.get("name"), e),
+            )
 
         sp = settings.sender_policy(user)
 
