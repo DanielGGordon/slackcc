@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 import uuid
 from collections import OrderedDict
@@ -163,10 +164,36 @@ class _SeenSet:
         return False
 
 
+class _ThreadLocks:
+    """One lock per Slack thread, so overlapping messages in the same thread
+    serialize instead of racing.
+
+    Bolt dispatches events concurrently, and `sessions.json` is only written
+    once a turn fully finishes. A follow-up sent before that write lands used
+    to look "new" to the bridge too, so it re-ran `thread.create` /
+    `thread.turn.start` against the same T3 thread id while the first turn
+    was still live -- T3's orchestration endpoint then 500s
+    (orchestration_dispatch_failed) on the collision, and the follow-up's own
+    Slack placeholder could be left stuck with no final reply ever posted."""
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._locks: dict[tuple[str, str], threading.Lock] = {}
+
+    def get(self, channel_id: str, thread_ts: str) -> threading.Lock:
+        key = (channel_id, thread_ts)
+        with self._guard:
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = self._locks[key] = threading.Lock()
+            return lock
+
+
 def build_app(settings: Settings) -> App:
     app = App(token=settings.bot_token)
     sessions = SessionStore(settings.sessions_path)
     claims = ClaimStore(claims_path())
+    thread_locks = _ThreadLocks()
     # Daemon-only state (no CLI reads it), so it lives next to sessions.json
     # rather than going through paths.py like the shared claims file.
     overrides = OverrideStore(settings.sessions_path.parent / "pps_overrides.json")
@@ -302,6 +329,13 @@ def build_app(settings: Settings) -> App:
             )
         prompt = "\n\n".join(parts)
 
+        # Serialize turns per Slack thread (see _ThreadLocks). Block here
+        # until any in-flight turn on this thread releases, then re-read
+        # `resume` -- it may have just been written by that turn.
+        thread_lock = thread_locks.get(channel_id, thread_ts)
+        thread_lock.acquire()
+        resume = sessions.get(channel_id, thread_ts)
+
         log.info("dispatch channel=%s project=%s user=%s resume=%s",
                  channel_id, cfg.project, user, bool(resume))
 
@@ -322,183 +356,196 @@ def build_app(settings: Settings) -> App:
             else:
                 say(text=final_text, thread_ts=thread_ts)
 
-        # --- pps gate: blocking prompt-protection screen for non-owner senders ---
-        if pps_override:
-            # An owner explicitly approved this exact message; `screened` stays
-            # as it is for this sender, so it rides as trusted text just like a
-            # judge-passed guest message would.
-            log.info("pps override by owner=%s thread=%s user=%s",
-                     event.get("_override_by"), thread_ts, user)
-        elif sp.pps_mode != "skip":
-            judged = text or ""
-            if files:
-                names = ", ".join(f.get("name", "?") for f in files)
-                judged += f"\n[attached files: {names}]"
-            policy = _pps_policy_text(sp, cfg, overrides.grants(channel_id, thread_ts))
-            verdict = pps_client.judge(sender=sp.name, policy=policy,
-                                       text=judged, context=f"slack:{channel_id}")
-            log.info("pps sender=%s(%s) mode=%s -> %s/%s: %s", sp.name, user,
-                     sp.pps_mode, verdict["verdict"], verdict.get("category"),
-                     verdict.get("reason"))
-            if sp.pps_mode == "enforce":
-                if verdict["verdict"] == "deny":
-                    category = verdict.get("category") or "other"
-                    reason = verdict.get("reason") or ""
-                    finish(f":no_entry: Message declined by the safety screen "
-                           f"({category}): {reason}")
-                    _ask_owners(event, category, reason, channel_id, thread_ts,
-                                say, logger)
-                    return
-                if verdict["verdict"] == "error":
-                    # Fail closed for guests: no screen, no turn.
-                    finish(":warning: The safety screen is unavailable right now, "
-                           "so I can't process this message. Please try again later.")
-                    return
+        try:
+            # --- pps gate: blocking prompt-protection screen for non-owner senders ---
+            if pps_override:
+                # An owner explicitly approved this exact message; `screened` stays
+                # as it is for this sender, so it rides as trusted text just like a
+                # judge-passed guest message would.
+                log.info("pps override by owner=%s thread=%s user=%s",
+                         event.get("_override_by"), thread_ts, user)
+            elif sp.pps_mode != "skip":
+                judged = text or ""
+                if files:
+                    names = ", ".join(f.get("name", "?") for f in files)
+                    judged += f"\n[attached files: {names}]"
+                policy = _pps_policy_text(sp, cfg, overrides.grants(channel_id, thread_ts))
+                verdict = pps_client.judge(sender=sp.name, policy=policy,
+                                           text=judged, context=f"slack:{channel_id}")
+                log.info("pps sender=%s(%s) mode=%s -> %s/%s: %s", sp.name, user,
+                         sp.pps_mode, verdict["verdict"], verdict.get("category"),
+                         verdict.get("reason"))
+                if sp.pps_mode == "enforce":
+                    if verdict["verdict"] == "deny":
+                        category = verdict.get("category") or "other"
+                        reason = verdict.get("reason") or ""
+                        finish(f":no_entry: Message declined by the safety screen "
+                               f"({category}): {reason}")
+                        _ask_owners(event, category, reason, channel_id, thread_ts,
+                                    say, logger)
+                        return
+                    if verdict["verdict"] == "error":
+                        # Fail closed for guests: no screen, no turn.
+                        finish(":warning: The safety screen is unavailable right now, "
+                               "so I can't process this message. Please try again later.")
+                        return
 
-        if cfg.backend == "t3" and t3_client and mirror:
-            # Slack thread <-> T3 thread, 1:1, deterministic id (so resume
-            # survives a lost sessions.json). thread.turn.start has no
-            # system-prompt field, so persona and protocol both come from the
-            # project's CLAUDE.md (T3 spawns with setting sources
-            # user,project,local) and only the routing header rides along.
-            #
-            # If `slackcc init-project` hasn't been run there, fall back to
-            # paying for the protocol inline on the first turn of the thread --
-            # the agent gets it either way, just less cheaply.
-            thread_id = resume or f"slack-{channel_id}-{thread_ts.replace('.', '-')}"
+            if cfg.backend == "t3" and t3_client and mirror:
+                # Slack thread <-> T3 thread, 1:1, deterministic id (so resume
+                # survives a lost sessions.json). thread.turn.start has no
+                # system-prompt field, so persona and protocol both come from the
+                # project's CLAUDE.md (T3 spawns with setting sources
+                # user,project,local) and only the routing header rides along.
+                #
+                # If `slackcc init-project` hasn't been run there, fall back to
+                # paying for the protocol inline on the first turn of the thread --
+                # the agent gets it either way, just less cheaply.
+                thread_id = resume or f"slack-{channel_id}-{thread_ts.replace('.', '-')}"
 
-            # Inline any downloaded images as real T3 attachments (T3 has no
-            # separate upload endpoint -- the bytes ride along as a base64
-            # data URL) so they render in the T3 GUI instead of only being a
-            # file-path note in the prompt text.
-            attachments: list[dict] = []
-            for p in local_paths:
-                try:
-                    att = build_t3_attachment(p)
-                except Exception:  # noqa: BLE001 - a bad attachment shouldn't kill the turn
-                    logger.warning("attachment encode failed for %s", p, exc_info=True)
-                    continue
-                if att is not None:
-                    attachments.append(att)
-            if len(attachments) > _MAX_T3_ATTACHMENTS:
-                logger.warning("dropping %d attachment(s) over T3's %d-per-message cap",
-                                len(attachments) - _MAX_T3_ATTACHMENTS, _MAX_T3_ATTACHMENTS)
-                attachments = attachments[:_MAX_T3_ATTACHMENTS]
+                # Inline any downloaded images as real T3 attachments (T3 has no
+                # separate upload endpoint -- the bytes ride along as a base64
+                # data URL) so they render in the T3 GUI instead of only being a
+                # file-path note in the prompt text.
+                attachments: list[dict] = []
+                for p in local_paths:
+                    try:
+                        att = build_t3_attachment(p)
+                    except Exception:  # noqa: BLE001 - a bad attachment shouldn't kill the turn
+                        logger.warning("attachment encode failed for %s", p, exc_info=True)
+                        continue
+                    if att is not None:
+                        attachments.append(att)
+                if len(attachments) > _MAX_T3_ATTACHMENTS:
+                    logger.warning("dropping %d attachment(s) over T3's %d-per-message cap",
+                                    len(attachments) - _MAX_T3_ATTACHMENTS, _MAX_T3_ATTACHMENTS)
+                    attachments = attachments[:_MAX_T3_ATTACHMENTS]
 
-            protocol = None
-            if resume is None and not bridgedoc.is_current(cfg.cwd):
-                log.warning("bridge protocol missing or out of date in %s/CLAUDE.md; "
-                            "injecting inline. Run: slackcc init-project %s",
-                            cfg.cwd, cfg.cwd)
-                protocol = bridgedoc.render()
-            mirror.register(thread_id, channel_id, thread_ts)
+                protocol = None
+                if resume is None and not bridgedoc.is_current(cfg.cwd):
+                    log.warning("bridge protocol missing or out of date in %s/CLAUDE.md; "
+                                "injecting inline. Run: slackcc init-project %s",
+                                cfg.cwd, cfg.cwd)
+                    protocol = bridgedoc.render()
+                mirror.register(thread_id, channel_id, thread_ts)
 
-            # The user was told "to unsettle this chat, simply reply" — honour it. The
-            # turn below auto-un-settles server-side too, but doing it explicitly also
-            # re-arms the announcement and covers a turn that never starts.
-            if mirror.settled_notice(thread_id) is not None:
-                try:
-                    t3_client.dispatch({
-                        "type": "thread.unsettle",
-                        "commandId": f"slack-uns-{uuid.uuid4().hex}",
-                        "threadId": thread_id,
-                        "reason": "user",
-                    })
-                except Exception:  # noqa: BLE001 - never let this break the turn
-                    log.warning("could not unsettle T3 thread %s", thread_id, exc_info=True)
-                mirror.set_settled_notice(thread_id, None)
+                # The user was told "to unsettle this chat, simply reply" — honour it. The
+                # turn below auto-un-settles server-side too, but doing it explicitly also
+                # re-arms the announcement and covers a turn that never starts.
+                if mirror.settled_notice(thread_id) is not None:
+                    try:
+                        t3_client.dispatch({
+                            "type": "thread.unsettle",
+                            "commandId": f"slack-uns-{uuid.uuid4().hex}",
+                            "threadId": thread_id,
+                            "reason": "user",
+                        })
+                    except Exception:  # noqa: BLE001 - never let this break the turn
+                        log.warning("could not unsettle T3 thread %s", thread_id, exc_info=True)
+                    mirror.set_settled_notice(thread_id, None)
 
-            # Live feedback: while the turn runs, edit the placeholder into a
-            # rolling status (agent narration + latest tool call from the T3
-            # snapshot) instead of leaving "working on it…" for minutes.
-            turn_started = time.monotonic()
+                # Live feedback: while the turn runs, edit the placeholder into a
+                # rolling status (agent narration + latest tool call from the T3
+                # snapshot) instead of leaving "working on it…" for minutes.
+                turn_started = time.monotonic()
 
-            def progress(update: str) -> None:
-                if not placeholder_ts:
-                    return
-                mins, secs = divmod(int(time.monotonic() - turn_started), 60)
-                body = scrub(update)[0]
-                client.chat_update(
-                    channel=channel_id, ts=placeholder_ts,
-                    text=(f":hourglass_flowing_sand: _working… {mins}m {secs:02d}s_\n"
-                          f"{body}")[:3900],
+                def progress(update: str) -> None:
+                    if not placeholder_ts:
+                        return
+                    mins, secs = divmod(int(time.monotonic() - turn_started), 60)
+                    body = scrub(update)[0]
+                    client.chat_update(
+                        channel=channel_id, ts=placeholder_ts,
+                        text=(f":hourglass_flowing_sand: _working… {mins}m {secs:02d}s_\n"
+                              f"{body}")[:3900],
+                    )
+
+                # A guest turn can park on an owner approval in the T3 GUI. The
+                # placeholder already says so (via progress); also page the owners
+                # by DM once per request, with a link, so it doesn't sit unseen.
+                def approval_wait(requests: list[dict]) -> None:
+                    what = "\n".join(
+                        f"• wants to {backend_t3.describe_request(r)}" for r in requests)
+                    permalink = None
+                    try:
+                        permalink = client.chat_getPermalink(
+                            channel=channel_id, message_ts=thread_ts).get("permalink")
+                    except Exception:  # noqa: BLE001 - link is a nicety
+                        logger.warning("could not get slack permalink", exc_info=True)
+                    gui = settings.t3_thread_url(thread_id)
+                    links = " · ".join(filter(None, [
+                        f"<{gui}|Open in T3>" if gui else None,
+                        f"<{permalink}|Slack thread>" if permalink else None,
+                    ]))
+                    note = scrub(
+                        f":raised_hand: <@{user}> has a turn waiting for your approval "
+                        f"in #{cfg.project} (T3 thread `{thread_id}`):\n{what}"
+                        + (f"\n{links}" if links else "")
+                        + f"\nIt pauses for up to {cfg.approval_timeout // 60} min; "
+                          "approve or deny in the T3 GUI.")[0]
+                    for owner_id in settings.owner_ids():
+                        try:
+                            client.chat_postMessage(channel=owner_id, text=note)
+                        except Exception:  # noqa: BLE001 - paging must not kill the turn
+                            logger.warning("approval DM to %s failed", owner_id, exc_info=True)
+
+                result = backend_t3.run_turn(
+                    prompt="\n\n".join(filter(None, [header, protocol, guard, prompt])),
+                    thread_id=thread_id,
+                    is_new=resume is None,
+                    project_id=cfg.t3_project_id or "",
+                    model=cfg.t3_model,
+                    attachments=attachments,
+                    title=f"#{channel_name}: {' '.join((text or 'attachment').split())[:60]}",
+                    client=t3_client,
+                    mirror=mirror,
+                    timeout=cfg.timeout,
+                    runtime_mode=sp.runtime_mode,
+                    on_progress=progress,
+                    on_approval_wait=approval_wait,
+                    approval_timeout=cfg.approval_timeout,
+                    owner_name=settings.t3_owner,
+                )
+            else:
+                result = backend.run_turn(
+                    prompt=prompt,
+                    cwd=cfg.cwd,
+                    claude_bin=settings.claude_bin,
+                    append_system_prompt=persona,
+                    allowed_tools=cfg.allowed_tools,
+                    # Guests never bypass: risky tools fail instead of auto-running.
+                    permission_mode=cfg.permission_mode if sp.role == "owner" else "default",
+                    resume=resume,
+                    timeout=cfg.timeout,
                 )
 
-            # A guest turn can park on an owner approval in the T3 GUI. The
-            # placeholder already says so (via progress); also page the owners
-            # by DM once per request, with a link, so it doesn't sit unseen.
-            def approval_wait(requests: list[dict]) -> None:
-                what = "\n".join(
-                    f"• wants to {backend_t3.describe_request(r)}" for r in requests)
-                permalink = None
-                try:
-                    permalink = client.chat_getPermalink(
-                        channel=channel_id, message_ts=thread_ts).get("permalink")
-                except Exception:  # noqa: BLE001 - link is a nicety
-                    logger.warning("could not get slack permalink", exc_info=True)
-                gui = settings.t3_thread_url(thread_id)
-                links = " · ".join(filter(None, [
-                    f"<{gui}|Open in T3>" if gui else None,
-                    f"<{permalink}|Slack thread>" if permalink else None,
-                ]))
-                note = scrub(
-                    f":raised_hand: <@{user}> has a turn waiting for your approval "
-                    f"in #{cfg.project} (T3 thread `{thread_id}`):\n{what}"
-                    + (f"\n{links}" if links else "")
-                    + f"\nIt pauses for up to {cfg.approval_timeout // 60} min; "
-                      "approve or deny in the T3 GUI.")[0]
-                for owner_id in settings.owner_ids():
-                    try:
-                        client.chat_postMessage(channel=owner_id, text=note)
-                    except Exception:  # noqa: BLE001 - paging must not kill the turn
-                        logger.warning("approval DM to %s failed", owner_id, exc_info=True)
+            if result.session_id:
+                sessions.set(channel_id, thread_ts, result.session_id)
 
-            result = backend_t3.run_turn(
-                prompt="\n\n".join(filter(None, [header, protocol, guard, prompt])),
-                thread_id=thread_id,
-                is_new=resume is None,
-                project_id=cfg.t3_project_id or "",
-                model=cfg.t3_model,
-                attachments=attachments,
-                title=f"#{channel_name}: {' '.join((text or 'attachment').split())[:60]}",
-                client=t3_client,
-                mirror=mirror,
-                timeout=cfg.timeout,
-                runtime_mode=sp.runtime_mode,
-                on_progress=progress,
-                on_approval_wait=approval_wait,
-                approval_timeout=cfg.approval_timeout,
-                owner_name=settings.t3_owner,
-            )
-        else:
-            result = backend.run_turn(
-                prompt=prompt,
-                cwd=cfg.cwd,
-                claude_bin=settings.claude_bin,
-                append_system_prompt=persona,
-                allowed_tools=cfg.allowed_tools,
-                # Guests never bypass: risky tools fail instead of auto-running.
-                permission_mode=cfg.permission_mode if sp.role == "owner" else "default",
-                resume=resume,
-                timeout=cfg.timeout,
-            )
+            if result.ok:
+                final = result.text or "(no output)"
+            elif result.awaiting_approval:
+                logger.info("turn parked on approval; released: %s", result.error)
+                final = (f":raised_hand: This needs {settings.t3_owner}'s approval in T3 "
+                         f"before it can continue, and I've been waiting a while. I've "
+                         f"pinged {settings.t3_owner}; the reply will show up in this "
+                         "thread once it's approved.")
+            else:
+                logger.error("turn failed: %s", result.error)
+                final = f":warning: I hit an error: {result.error}"
 
-        if result.session_id:
-            sessions.set(channel_id, thread_ts, result.session_id)
-
-        if result.ok:
-            final = result.text or "(no output)"
-        elif result.awaiting_approval:
-            logger.info("turn parked on approval; released: %s", result.error)
-            final = (f":raised_hand: This needs {settings.t3_owner}'s approval in T3 "
-                     f"before it can continue, and I've been waiting a while. I've "
-                     f"pinged {settings.t3_owner}; the reply will show up in this "
-                     "thread once it's approved.")
-        else:
-            logger.error("turn failed: %s", result.error)
-            final = f":warning: I hit an error: {result.error}"
-
-        finish(final)
+            finish(final)
+        except Exception:
+            # Resolve the Slack placeholder no matter what -- this is the one
+            # thing that must never happen: a "working…" message with no
+            # reply ever. Still re-raise so callers with their own crash
+            # handling (e.g. _answer_override withholding a pps grant for a
+            # replay that blew up) keep seeing the failure.
+            logger.exception("unhandled error handling slack thread=%s", thread_ts)
+            finish(":warning: Something went wrong on my end handling that message; "
+                   "please try again.")
+            raise
+        finally:
+            thread_lock.release()
 
     def _ask_owners(event: dict, category: str, reason: str, channel_id: str,
                     thread_ts: str, say, logger) -> None:
