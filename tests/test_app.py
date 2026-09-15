@@ -9,6 +9,7 @@ MirrorStore, OverrideStore)."""
 from __future__ import annotations
 
 import json
+import threading
 import time
 from types import SimpleNamespace
 
@@ -114,6 +115,9 @@ class FakeLogger:
         self.warnings.append((a, kw))
 
     def error(self, *a, **kw):
+        self.errors.append((a, kw))
+
+    def exception(self, *a, **kw):
         self.errors.append((a, kw))
 
     def info(self, *a, **kw):
@@ -1235,6 +1239,97 @@ def test_handle_t3_unscreened_guest_gets_the_guard_inline(make_env):
     assert prompt.startswith(bridge_header("Ct3", "90.7"))
     assert SAFETY_PREAMBLE in prompt
     assert wrap_untrusted("slack", "Ulogger", "hi") in prompt
+
+
+# --------------------------------------------------------------------------- #
+# handle(): per-thread serialization + crash safety
+#
+# Motivating incident: a follow-up sent in the same Slack thread before the
+# first turn finished used to race T3's thread.create/turn.start for the same
+# thread id (sessions.json is only written once a turn completes, so the
+# second call still saw resume=None) -- T3 500s on the collision
+# (orchestration_dispatch_failed) and the follow-up's own Slack placeholder
+# could be left stuck on "working…" with no final reply ever posted.
+# --------------------------------------------------------------------------- #
+
+
+def test_handle_second_message_in_same_thread_waits_for_first_turn(make_env, monkeypatch):
+    env = make_env()
+
+    entered_first = threading.Event()
+    release_first = threading.Event()
+    calls: list[dict] = []
+    calls_guard = threading.Lock()
+
+    def turn(**kwargs):
+        with calls_guard:
+            calls.append(kwargs)
+            is_first = len(calls) == 1
+        if is_first:
+            entered_first.set()
+            assert release_first.wait(timeout=5), "first turn was never released"
+        # Real backend_t3.run_turn always echoes the thread id back as the
+        # session id -- the fake must too, or the second call's `resume`
+        # wouldn't line up with the first call's `thread_id`.
+        return TurnResult(ok=True, text="reply", session_id=kwargs["thread_id"])
+
+    monkeypatch.setattr(app_mod.backend_t3, "run_turn", turn)
+
+    t1 = threading.Thread(
+        target=call_handle,
+        args=(env, make_event(channel="Ct3", user="Uowner", ts="300.1", text="first")),
+    )
+    t1.start()
+    assert entered_first.wait(timeout=5), "first turn never started"
+
+    t2 = threading.Thread(
+        target=call_handle,
+        args=(env, make_event(channel="Ct3", user="Uowner", ts="300.2",
+                               thread_ts="300.1", text="second")),
+    )
+    t2.start()
+    # The second handler should be blocked on the thread lock, not racing in.
+    time.sleep(0.2)
+    assert len(calls) == 1
+
+    release_first.set()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+    assert not t1.is_alive() and not t2.is_alive()
+
+    assert len(calls) == 2
+    first_call, second_call = calls
+    assert first_call["is_new"] is True
+    # By the time the second call ran, the first turn's session id had
+    # already been persisted -- so it resumes the same T3 thread instead of
+    # re-dispatching thread.create onto it.
+    assert second_call["is_new"] is False
+    assert second_call["thread_id"] == first_call["thread_id"]
+
+
+def test_handle_unhandled_exception_still_resolves_placeholder_then_reraises(
+    make_env, monkeypatch,
+):
+    env = make_env()
+    monkeypatch.setattr(app_mod.backend_t3, "run_turn",
+                        lambda **kw: (_ for _ in ()).throw(RuntimeError("t3 exploded")))
+
+    with pytest.raises(RuntimeError, match="t3 exploded"):
+        call_handle(env, make_event(channel="Ct3", user="Uowner", ts="310.1"))
+
+    # The placeholder must never be left on "working…" -- even a bug that
+    # throws instead of returning a TurnResult has to resolve it.
+    assert len(env.client.chat_update_calls) == 1
+    assert "went wrong" in env.client.chat_update_calls[0]["text"]
+
+    # And the per-thread lock must still be released after the crash, or
+    # every later message in this thread would hang forever.
+    monkeypatch.setattr(app_mod.backend_t3, "run_turn",
+                        lambda **kw: TurnResult(ok=True, text="recovered",
+                                                session_id=kw["thread_id"]))
+    call_handle(env, make_event(channel="Ct3", user="Uowner", ts="310.2",
+                                 thread_ts="310.1"))
+    assert env.client.chat_update_calls[-1]["text"] == "recovered"
 
 
 # --------------------------------------------------------------------------- #
