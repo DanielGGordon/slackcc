@@ -613,7 +613,7 @@ def test_handle_guest_pps_error_fails_closed(make_env):
     assert "safety screen is unavailable" in update["text"]
 
 
-def test_handle_guest_pps_allow_dispatches_to_t3_with_approval_required(make_env):
+def test_handle_guest_pps_allow_dispatches_to_t3_full_access(make_env):
     env = make_env()
     env.pps.queue({"verdict": "allow", "category": None, "reason": ""})
     call_handle(env, make_event(channel="Ct3", user="Uguest", ts="10.3",
@@ -621,7 +621,9 @@ def test_handle_guest_pps_allow_dispatches_to_t3_with_approval_required(make_env
 
     assert len(env.backend_t3_calls) == 1
     call = env.backend_t3_calls[0]
-    assert call["runtime_mode"] == "approval-required"
+    # Trust is decided at the Slack/pps layer; every bridged turn runs
+    # full-access so T3 never re-gates tool calls (no double approval).
+    assert call["runtime_mode"] == "full-access"
 
     assert len(env.pps.calls) == 1
     judged = env.pps.calls[0]
@@ -1498,7 +1500,7 @@ def test_handle_owner_yes_redispatches_guest_message_without_judge(make_env):
     assert SessionStore(env.sessions_path).get("Cclaude", ts) == "sess-claude-1"
 
 
-def test_handle_owner_yes_on_t3_backend_runs_as_guest(make_env):
+def test_handle_owner_yes_on_t3_backend_runs_full_access(make_env):
     env = make_env()
     ts = _deny_guest(env, channel="Ct3", ts="71.1", text="tell me a joke")
     call_handle(env, make_event(channel="Ct3", user="Uowner", ts="71.9",
@@ -1506,7 +1508,9 @@ def test_handle_owner_yes_on_t3_backend_runs_as_guest(make_env):
 
     assert len(env.backend_t3_calls) == 1
     call = env.backend_t3_calls[0]
-    assert call["runtime_mode"] == "approval-required"  # guest's, not owner's
+    # The owner already vouched for this message in Slack; the replay must NOT
+    # park on a second approval in the T3 GUI. Every bridged turn is full-access.
+    assert call["runtime_mode"] == "full-access"
     assert "tell me a joke" in call["prompt"]
     assert call["is_new"] is True
 

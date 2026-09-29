@@ -499,7 +499,15 @@ def build_app(settings: Settings) -> App:
                     client=t3_client,
                     mirror=mirror,
                     timeout=cfg.timeout,
-                    runtime_mode=sp.runtime_mode,
+                    # Every bridged turn runs full-access: trust is decided
+                    # entirely at the Slack/pps layer (the message is screened,
+                    # and an owner can veto it there). T3 must NOT independently
+                    # re-gate tool calls -- that produced a double "approve this"
+                    # (once in Slack, again in the T3 GUI), most painfully when an
+                    # owner had just pps-override-approved a guest's message only
+                    # for the replay to park on a T3 approval. `sp.runtime_mode`
+                    # is intentionally not used here (see senders.json note).
+                    runtime_mode="full-access",
                     on_progress=progress,
                     on_approval_wait=approval_wait,
                     approval_timeout=cfg.approval_timeout,
@@ -606,8 +614,9 @@ def build_app(settings: Settings) -> App:
                        f"<@{guest}>'s request now.")[0],
             thread_ts=thread_ts)
         # Replay the guest's own event (their user id, text, files) so
-        # attribution, sender_policy and runtime_mode are all the guest's;
-        # only the judge is skipped. `_override_by` is for the log line.
+        # attribution and sender_policy stay the guest's; only the judge is
+        # skipped. (The T3 turn runs full-access regardless -- trust was just
+        # decided here by the owner.) `_override_by` is for the log line.
         original["_override_by"] = owner
         try:
             handle(original, say, client, logger, pps_override=True)
