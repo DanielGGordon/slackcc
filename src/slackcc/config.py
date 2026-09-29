@@ -52,13 +52,16 @@ class ChannelConfig:
 
 @dataclass(frozen=True)
 class SenderPolicy:
-    """Per-sender permissions: who runs with which T3 runtime mode and whether
-    their messages pass through pps (the prompt-protection judge) first."""
+    """Per-sender permissions: the sender's role and whether their messages
+    pass through pps (the prompt-protection judge) first. Trust for bridged
+    turns is decided here at the Slack/pps layer -- `runtime_mode` is retained
+    for wire/back-compat but is NOT applied to T3 turns: the bridge always
+    dispatches full-access so T3 never re-gates tool calls (see app.py)."""
 
     user_id: str
     name: str
     role: str = "guest"  # "owner" | "guest"
-    runtime_mode: str = "approval-required"  # T3 RuntimeMode wire value
+    runtime_mode: str = "approval-required"  # legacy; bridge forces full-access
     pps_mode: str = "enforce"  # "skip" | "log" | "enforce"
     policy_extra: str = ""  # appended to the generated pps policy text
 

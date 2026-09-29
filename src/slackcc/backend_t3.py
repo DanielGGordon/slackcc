@@ -16,14 +16,17 @@ While the turn is still running, the same polls feed `on_progress` with a
 summary of the in-flight work (newest narration segment + newest tool call),
 which the caller can surface (e.g. by editing the Slack placeholder).
 
-Approval-required turns (guests) can block on a human: T3 parks the turn on a
-`approval.requested` / `user-input.requested` activity until someone acts in
-the GUI. That wait is not the agent's time, so the turn `timeout` clock pauses
-while a request is pending, `on_approval_wait` fires once per new request (so
-the caller can page the owner), and a separate `approval_timeout` bounds how
-long the bridge holds the Slack thread. When that expires the turn is left
-running -- NOT interrupted -- so the owner can still approve later; the mirror
-delivers the eventual reply into Slack (`TurnResult.awaiting_approval`).
+A turn can still block on a human: T3 parks it on an `approval.requested` /
+`user-input.requested` activity until someone acts in the GUI. The bridge runs
+every turn full-access (trust is decided at the Slack/pps layer), so tool-call
+approvals don't fire here; what remains is the agent explicitly asking a
+question (`user-input.requested`, e.g. AskUserQuestion). That wait is not the
+agent's time, so the turn `timeout` clock pauses while a request is pending,
+`on_approval_wait` fires once per new request (so the caller can page the
+owner), and a separate `approval_timeout` bounds how long the bridge holds the
+Slack thread. When that expires the turn is left running -- NOT interrupted --
+so the owner can still answer later; the mirror delivers the eventual reply
+into Slack (`TurnResult.awaiting_approval`).
 """
 
 from __future__ import annotations
@@ -169,8 +172,8 @@ def run_turn(
             "text": prompt,
             "attachments": attachments or [],
         },
-        # Owner gets full-access (bypass); guests get approval-required so
-        # risky tool calls wait for approval in the T3 GUI (see senders.json).
+        # The bridge always passes full-access: trust is decided at the
+        # Slack/pps layer, so T3 never re-gates tool calls (see app.py).
         "runtimeMode": runtime_mode,
         "interactionMode": "default",
         "createdAt": dispatched_at,
