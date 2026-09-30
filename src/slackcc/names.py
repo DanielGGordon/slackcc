@@ -83,6 +83,14 @@ class NameResolver:
         self._warned_users = False
         self._warned_channels = False
 
+    def set_reserved(self, reserved: set[str] | frozenset[str]) -> None:
+        """senders.json changed under a running daemon (config_api.py): the
+        new names are reserved from now on, and every cached user name is
+        dropped, since one may now collide with a configured sender."""
+        with self._lock:
+            self._reserved = {r.lower() for r in reserved}
+            self._users.clear()
+
     # -- cache helpers ----------------------------------------------------
 
     def _get(self, cache: dict[str, tuple[str, float | None]], key: str) -> str | None:

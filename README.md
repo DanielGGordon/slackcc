@@ -136,6 +136,30 @@ For the `t3` backend, also set `SLACKCC_T3_URL`/`SLACKCC_T3_TOKEN` in `.env`,
 and run the pps judge (separate repo/service) at `SLACKCC_PPS_URL` if you have
 guest senders — guests fail closed when it's unreachable.
 
+### Changing the config while the daemon runs
+
+The daemon reads both files at start and then **reloads without a restart**:
+
+- **SIGHUP** reloads whatever is on disk (a hand edit). If the files don't
+  load, the daemon logs why and keeps running the config it had. With the
+  systemd unit, add `ExecReload=/bin/kill -HUP $MAINPID` under `[Service]`
+  and use `systemctl --user reload slackcc`.
+- **The loopback config API** (`src/slackcc/config_api.py`) is how another
+  program on the box changes the config — Alfred's admin *Slack* screen does.
+  Set `SLACKCC_CONFIG_TOKEN` (24+ random characters, e.g.
+  `openssl rand -hex 24`) in `.env`; the API binds `127.0.0.1:8643`
+  (`SLACKCC_CONFIG_PORT` to move it). No token, no API.
+
+  | Route | Body / answer |
+  |---|---|
+  | `GET /config` | `{etag, channels, senders, senders_file, problems[], effective, loaded:{etag,at,source}, loaded_current}` — the two files as JSON, and the *effective* config the daemon runs with (every default applied; `effective` is the only place defaults live) |
+  | `PUT /config` | `{if_match, channels?, senders?, dry_run?}` → validated by the same parser the daemon starts with, both files backed up to `.state/config-backups/` (last 20), written atomically, swapped into the running daemon. `dry_run: true` answers `{effective}` for the candidate and writes nothing. 409 `stale` when `if_match` isn't the current etag, 422 `invalid` with the loader's message, 422 `restart_required` for the first `t3` channel (the T3 client only starts at boot) |
+  | `GET /healthz` | `{ok:true}`, no token |
+
+  Every `/config` request needs `Authorization: Bearer $SLACKCC_CONFIG_TOKEN`.
+  Only the routing map and sender policy reload; tokens and URLs still need a
+  restart. A turn already running finishes on the config it started with.
+
 ## 3. Install & run
 
 ```bash
@@ -204,7 +228,9 @@ src/slackcc/
   t3_mirror.py  background poller: T3 GUI turns -> Slack thread
   pps.py        client for the Prompt Protection Service judge
   outbound.py   secret scrubbing for everything posted to Slack
-  config.py     env + channels.json + senders.json loading, per-sender policy
+  config.py     env + channels.json + senders.json loading, per-sender policy,
+                the effective-config view, LiveSettings (the swappable config)
+  config_api.py loopback GET/PUT /config + SIGHUP reload (no restart to change config)
   sessions.py   thread -> session/thread id store (resume continuity)
   overrides.py  owner yes/no override of pps denials (pending asks + grants)
   sanitize.py   fencing for the messages pps didn't gate
@@ -214,5 +240,6 @@ src/slackcc/
 config/channels.example.json
 config/senders.example.json
 .state/pps_overrides.json   per-thread pending owner asks + granted requests
+.state/config-backups/      the files as they were before each config API write (last 20)
 BACKLOG.md
 ```

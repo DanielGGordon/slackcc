@@ -1833,3 +1833,52 @@ def test_handle_markdown_shaped_profile_name_cannot_hide_the_message(make_env):
     # The backtick name is worthless (no alphanumeric) so real_name is used,
     # minus the heading marker.
     assert env.backend_calls[0]["prompt"] == "Admin from #claude-chan: hi"
+
+
+# --------------------------------------------------------------------------- #
+# live config (config_api.py swaps LiveSettings under a running daemon)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_swapped_config_routes_the_next_event_without_a_restart(make_env):
+    from dataclasses import replace
+
+    env = make_env()
+    live = env.app.slackcc_live
+    assert live.t3_ready is True
+    # A stranger is screened under the guest defaults...
+    env.handle(make_event(channel="Cclaude", user="Ustranger", text="hi", ts="1.1"),
+               env.say, env.client, env.logger)
+    assert len(env.pps.calls) == 1
+    # ...until the config API makes them an owner: no pps call, no restart.
+    owner = SenderPolicy(user_id="Ustranger", name="Stranger", role="owner",
+                         runtime_mode="full-access", pps_mode="skip")
+    live.swap(replace(env.settings, senders={**env.settings.senders, "Ustranger": owner}),
+              etag="e2", source="api")
+    env.handle(make_event(channel="Cclaude", user="Ustranger", text="hi again", ts="1.2"),
+               env.say, env.client, env.logger)
+    assert len(env.pps.calls) == 1
+    # A channel dropped from the map is ignored from the next event on.
+    channels = {k: v for k, v in env.settings.channels.items() if k != "Cclaude"}
+    live.swap(replace(live.current, channels=channels), etag="e3", source="api")
+    before = len(env.backend_calls)
+    env.handle(make_event(channel="Cclaude", user="Uowner", text="anyone?", ts="1.3"),
+               env.say, env.client, env.logger)
+    assert len(env.backend_calls) == before
+
+
+def test_a_swap_updates_the_reserved_sender_names(make_env):
+    from dataclasses import replace
+
+    env = make_env()
+    live = env.app.slackcc_live
+    # "Berish Perlman" is Uguest's Slack profile name; once an operator
+    # configures a sender with that name, the unconfigured account shows by id.
+    configured = SenderPolicy(user_id="Uother", name="Berish Perlman", role="guest")
+    live.swap(replace(env.settings, senders={**env.settings.senders, "Uother": configured}),
+              etag="e2", source="api")
+    env.handle(make_event(channel="Cclaude", user="Uguest", text="hello", ts="2.1"),
+               env.say, env.client, env.logger)
+    prompt = env.backend_calls[-1]["prompt"]
+    assert "Berish Perlman from" not in prompt
+    assert "Uguest" in prompt

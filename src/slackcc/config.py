@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
-from dataclasses import dataclass, field
+import threading
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -83,6 +86,9 @@ class Settings:
     pps_url: str = "http://127.0.0.1:8642"
     senders: dict[str, SenderPolicy] = field(default_factory=dict)
     guest_defaults: SenderPolicy | None = None
+    # Where senders came from; None only for Settings built by hand (tests).
+    # The config API (config_api.py) writes back to config_path + senders_path.
+    senders_path: Path | None = None
 
     def channel(self, channel_id: str) -> ChannelConfig | None:
         return self.channels.get(channel_id)
@@ -125,8 +131,11 @@ def _require_env(name: str) -> str:
     return val
 
 
-def load_channels(config_path: Path) -> dict[str, ChannelConfig]:
-    raw = json.loads(config_path.read_text())
+def parse_channels(raw: dict) -> dict[str, ChannelConfig]:
+    """channels.json, already parsed. Raises (ValueError/KeyError/TypeError)
+    exactly where the daemon would refuse to start."""
+    if not isinstance(raw, dict):
+        raise ValueError("channels.json must be a JSON object")
     out: dict[str, ChannelConfig] = {}
     for channel_id, spec in raw.get("channels", {}).items():
         if channel_id.startswith("_"):  # allow `_comment` style keys
@@ -152,10 +161,16 @@ def load_channels(config_path: Path) -> dict[str, ChannelConfig]:
     return out
 
 
-def load_senders(path: Path) -> tuple[dict[str, SenderPolicy], SenderPolicy | None]:
-    if not path.exists():
+def load_channels(config_path: Path) -> dict[str, ChannelConfig]:
+    return parse_channels(json.loads(config_path.read_text()))
+
+
+def parse_senders(raw: dict | None) -> tuple[dict[str, SenderPolicy], SenderPolicy | None]:
+    """senders.json, already parsed; None = no file (protection off)."""
+    if raw is None:
         return {}, None
-    raw = json.loads(path.read_text())
+    if not isinstance(raw, dict):
+        raise ValueError("senders.json must be a JSON object")
 
     def _mk(user_id: str, spec: dict, base_role: str) -> SenderPolicy:
         role = spec.get("role", base_role)
@@ -182,6 +197,53 @@ def load_senders(path: Path) -> tuple[dict[str, SenderPolicy], SenderPolicy | No
     return senders, guest_defaults
 
 
+def load_senders(path: Path) -> tuple[dict[str, SenderPolicy], SenderPolicy | None]:
+    if not path.exists():
+        return {}, None
+    return parse_senders(json.loads(path.read_text()))
+
+
+def check_settings(settings: Settings) -> None:
+    """Cross-checks between the routing map and the environment."""
+    if settings.has_t3_channels() and not settings.t3_token:
+        raise RuntimeError("A channel uses backend 't3' but SLACKCC_T3_TOKEN is not set")
+
+
+def with_config(settings: Settings, channels_raw: dict,
+                senders_raw: dict | None) -> Settings:
+    """The same Settings (tokens, URLs, paths from the environment) with a new
+    routing map and sender policy. Raises like load_settings() would."""
+    channels = parse_channels(channels_raw)
+    senders, guest_defaults = parse_senders(senders_raw)
+    out = replace(settings, channels=channels, senders=senders,
+                  guest_defaults=guest_defaults)
+    check_settings(out)
+    return out
+
+
+def effective(settings: Settings) -> dict:
+    """What the daemon is actually running with, defaults applied -- the one
+    source of truth for "what does an unset key mean" (Alfred's admin reads
+    this through GET /config instead of keeping its own defaults table)."""
+    def ch(c: ChannelConfig) -> dict:
+        return {"project": c.project, "cwd": c.cwd, "backend": c.backend,
+                "t3_project_id": c.t3_project_id, "t3_model": c.t3_model,
+                "permission_mode": c.permission_mode, "timeout": c.timeout,
+                "approval_timeout": c.approval_timeout,
+                "require_mention": c.require_mention}
+
+    def sp(p: SenderPolicy) -> dict:
+        return {"name": p.name, "role": p.role, "runtime_mode": p.runtime_mode,
+                "pps_mode": p.pps_mode, "policy_extra": p.policy_extra}
+
+    return {
+        "channels": {k: ch(v) for k, v in settings.channels.items()},
+        "senders": {k: sp(v) for k, v in settings.senders.items()},
+        "guest_defaults": sp(settings.guest_defaults)
+        if settings.guest_defaults is not None else None,
+    }
+
+
 def load_settings() -> Settings:
     config_path = Path(os.environ.get("SLACKCC_CONFIG", "./config/channels.json"))
     sessions_path = Path(os.environ.get("SLACKCC_SESSIONS", "./.state/sessions.json"))
@@ -202,7 +264,49 @@ def load_settings() -> Settings:
         pps_url=os.environ.get("SLACKCC_PPS_URL", "http://127.0.0.1:8642"),
         senders=senders,
         guest_defaults=guest_defaults,
+        senders_path=senders_path,
     )
-    if settings.has_t3_channels() and not settings.t3_token:
-        raise RuntimeError("A channel uses backend 't3' but SLACKCC_T3_TOKEN is not set")
+    check_settings(settings)
     return settings
+
+
+class LiveSettings:
+    """The Settings a running daemon routes by, swappable without a restart.
+
+    Handlers read `.current` once per event and use that snapshot for the
+    whole turn, so a reload mid-turn never mixes two configs. Only the
+    routing map and sender policy ever change here (config_api.py); tokens,
+    URLs and paths stay what the process started with."""
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._lock = threading.Lock()
+        self._listeners: list = []
+        # Whether a T3 client exists in this process. build_app sets it; a
+        # config adding the FIRST t3 channel needs a restart, not a reload.
+        self.t3_ready = settings.has_t3_channels()
+        self.loaded: dict = {"etag": None, "at": _utc_now(), "source": "start"}
+
+    @property
+    def current(self) -> Settings:
+        return self._settings
+
+    def subscribe(self, fn) -> None:
+        """fn(new_settings) after every swap (e.g. the name resolver's reserved set)."""
+        with self._lock:
+            self._listeners.append(fn)
+
+    def swap(self, settings: Settings, *, etag: str | None, source: str) -> None:
+        with self._lock:
+            self._settings = settings
+            self.loaded = {"etag": etag, "at": _utc_now(), "source": source}
+            listeners = list(self._listeners)
+        for fn in listeners:
+            try:
+                fn(settings)
+            except Exception:  # noqa: BLE001 - a listener must not undo a reload
+                logging.getLogger(__name__).exception("settings listener failed")
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
