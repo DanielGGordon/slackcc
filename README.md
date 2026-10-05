@@ -153,12 +153,22 @@ The daemon reads both files at start and then **reloads without a restart**:
   | Route | Body / answer |
   |---|---|
   | `GET /config` | `{etag, channels, senders, senders_file, problems[], effective, loaded:{etag,at,source}, loaded_current}` — the two files as JSON, and the *effective* config the daemon runs with (every default applied; `effective` is the only place defaults live) |
-  | `PUT /config` | `{if_match, channels?, senders?, dry_run?}` → validated by the same parser the daemon starts with, both files backed up to `.state/config-backups/` (last 20), written atomically, swapped into the running daemon. `dry_run: true` answers `{effective}` for the candidate and writes nothing. 409 `stale` when `if_match` isn't the current etag, 422 `invalid` with the loader's message, 422 `restart_required` for the first `t3` channel (the T3 client only starts at boot) |
+  | `PUT /config` | `{if_match, channels?, senders?, dry_run?}` → validated by the same parser the daemon starts with, both files backed up to `.state/config-backups/` (last 20), written atomically, swapped into the running daemon. `dry_run: true` answers `{effective}` for the candidate and writes nothing. 409 `stale` when `if_match` isn't the current etag, 422 `invalid` with the loader's message, 422 `restart_required` for the first `t3` channel (the T3 client only starts at boot), 422 `senders_missing` when `senders.json` has gone but the daemon is running a sender policy |
   | `GET /healthz` | `{ok:true}`, no token |
 
   Every `/config` request needs `Authorization: Bearer $SLACKCC_CONFIG_TOKEN`.
   Only the routing map and sender policy reload; tokens and URLs still need a
   restart. A turn already running finishes on the config it started with.
+
+  Neither a reload nor a PUT ever turns sender protection *off*: a missing
+  `senders.json` means "everyone is the owner" only at start. If the file
+  vanishes under a daemon running a sender policy, both refuse and keep that
+  policy — to really turn protection off, remove the file and restart.
+  Every field is type-checked, and every enum (`role`, `pps_mode`) is checked
+  in `guest_defaults` too, so nothing that loads can break a turn or the next
+  start. A process killed between the two file renames can leave new
+  `senders.json` with old `channels.json`; the pair from before the write is
+  in `.state/config-backups/`.
 
 ## 3. Install & run
 

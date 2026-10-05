@@ -164,7 +164,23 @@ def test_put_stale_etag_is_refused(world):
     (lambda c, s: s["senders"]["UGUEST1"].update(pps_mode="off"), "unknown pps_mode"),
     (lambda c, s: c["channels"]["C1"].update(cwd="/definitely/not/here"), "cwd does not exist"),
     (lambda c, s: c["channels"]["C1"].update(timeout="soon"), "ValueError"),
-    (lambda c, s: c["channels"]["C1"].pop("project"), "KeyError"),
+    (lambda c, s: c["channels"]["C1"].pop("project"), "needs project and cwd"),
+    # A guest_defaults typo would fail OPEN (enforcement is pps_mode == "enforce").
+    (lambda c, s: s["guest_defaults"].update(pps_mode="enfroce"), "guest_defaults: unknown pps_mode"),
+    (lambda c, s: s["guest_defaults"].update(role="owner"), "guest_defaults: role must be guest"),
+    # Values the old parser let through that break a turn or the next start.
+    (lambda c, s: s["senders"]["UGUEST1"].update(name=[]), "name must be a non-empty string"),
+    (lambda c, s: s["senders"]["UGUEST1"].update(policy_extra=7), "policy_extra"),
+    (lambda c, s: s["senders"].update(UNEW1="guest"), "sender UNEW1: must be a JSON object"),
+    (lambda c, s: c["channels"]["C1"].update(t3_model=[]), "t3_model must be an object"),
+    (lambda c, s: c["channels"]["C1"].update(t3_model={"instanceId": "claudeAgent"}), "t3_model"),
+    (lambda c, s: c["channels"]["C1"].update(timeout=0), "positive whole number"),
+    (lambda c, s: c["channels"]["C1"].update(approval_timeout=-5), "positive whole number"),
+    (lambda c, s: c["channels"]["C1"].update(timeout=True), "whole number of seconds"),
+    (lambda c, s: c["channels"]["C1"].update(persona=5), "persona"),
+    (lambda c, s: c["channels"]["C1"].update(allowed_tools="Read"), "allowed_tools"),
+    (lambda c, s: c["channels"]["C1"].update(project=None), "project must be a non-empty string"),
+    (lambda c, s: c.update(channels=[]), "`channels` must be a JSON object"),
 ])
 def test_put_invalid_is_refused_and_nothing_changes(world, mutate, needle):
     channels, senders = json.loads(world.channels_path.read_text()), json.loads(world.senders_path.read_text())
@@ -262,6 +278,81 @@ def test_reload_picks_up_a_hand_edit(world):
     assert world.live.current.sender_policy("UGUEST1").role == "owner"
     assert world.live.loaded["source"] == "sighup"
     assert world.service.get()["loaded_current"] is True
+
+
+def test_reload_refuses_an_invalid_guest_default(world):
+    running = world.live.current
+    senders = json.loads(world.senders_path.read_text())
+    senders["guest_defaults"]["pps_mode"] = "enfroce"
+    world.senders_path.write_text(serialize(senders))
+    ok, message = world.service.reload()
+    assert ok is False and "guest_defaults: unknown pps_mode" in message
+    assert world.live.current is running
+    assert world.live.current.sender_policy("USTRANGER").pps_mode == "enforce"
+
+
+def test_reload_never_turns_protection_off_when_senders_json_vanishes(world):
+    running = world.live.current
+    world.senders_path.unlink()
+    ok, message = world.service.reload()
+    assert ok is False and "senders.json is missing" in message
+    assert world.live.current is running
+    stranger = world.live.current.sender_policy("USTRANGER")
+    assert (stranger.role, stranger.pps_mode) == ("guest", "enforce")
+
+
+def test_channels_only_put_does_not_adopt_a_vanished_senders_json(world):
+    running = world.live.current
+    world.senders_path.unlink()
+    channels = json.loads(world.channels_path.read_text())
+    channels["channels"]["C1"]["timeout"] = 900
+    before = world.channels_path.read_text()
+    with pytest.raises(ApiError) as e:
+        world.service.put({"if_match": _etag(world), "channels": channels})
+    assert e.value.status == 422 and e.value.body["error"] == "senders_missing"
+    assert world.channels_path.read_text() == before
+    assert world.live.current is running
+    # Sending a senders policy alongside is fine: protection stays on.
+    out = world.service.put({"if_match": _etag(world), "channels": channels,
+                             "senders": world.senders})
+    assert out["changed"] is True and world.senders_path.exists()
+    assert world.live.current.sender_policy("USTRANGER").role == "guest"
+
+
+def test_get_waits_for_an_in_progress_write(world, monkeypatch):
+    """GET shares the write lock: it never reports new senders.json bytes
+    with old channels.json bytes from halfway through a two-file write."""
+    import threading
+    from slackcc import config_api
+    real = config_api._atomic_write
+    in_write, release = threading.Event(), threading.Event()
+
+    def slow(path, text):
+        real(path, text)
+        if path == world.senders_path:
+            in_write.set()
+            release.wait(5)
+
+    monkeypatch.setattr(config_api, "_atomic_write", slow)
+    channels, senders = json.loads(world.channels_path.read_text()), json.loads(world.senders_path.read_text())
+    senders["senders"]["UGUEST1"]["name"] = "Igor B"
+    channels["channels"]["C1"]["timeout"] = 900
+    etag = _etag(world)
+    writer = threading.Thread(target=world.service.put,
+                              args=({"if_match": etag, "channels": channels, "senders": senders},))
+    writer.start()
+    assert in_write.wait(5)
+    got: list[dict] = []
+    reader = threading.Thread(target=lambda: got.append(world.service.get()))
+    reader.start()
+    reader.join(timeout=0.2)
+    assert reader.is_alive()  # blocked behind the write, not reading half of it
+    release.set()
+    writer.join(5)
+    reader.join(5)
+    assert got[0]["channels"]["channels"]["C1"]["timeout"] == 900
+    assert got[0]["senders"]["senders"]["UGUEST1"]["name"] == "Igor B"
+    assert got[0]["loaded_current"] is True
 
 
 def test_reload_keeps_the_running_config_when_the_files_do_not_load(world):

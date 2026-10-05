@@ -199,3 +199,30 @@ def test_sender_skips_lookup_for_userless_events():
 def test_module_uses_time_monotonic_for_expiry():
     # Guard for the monkeypatch strategy above.
     assert names_mod.time is time
+
+
+def test_reload_landing_mid_lookup_cannot_cache_a_newly_reserved_name():
+    """set_reserved (a config reload) racing a lookup: the reserved check and
+    the cache write are one critical section, so the reload lands wholly
+    before or wholly after them -- never between, where it would clear the
+    cache and then have the old lookup re-insert the now-reserved name."""
+    import threading
+
+    r = NameResolver()
+    client = _Client(user={"profile": {"display_name": "Dan"}})
+    reloads: list[threading.Thread] = []
+
+    class _ReloadOnCheck(set):
+        def __contains__(self, item):
+            if not reloads:  # the reload arrives right as the lookup checks
+                t = threading.Thread(target=r.set_reserved, args=({"Dan"},))
+                reloads.append(t)
+                t.start()
+                t.join(timeout=0.2)  # unsynchronised code lets it finish here
+            return super().__contains__(item)
+
+    r._reserved = _ReloadOnCheck()
+    r.sender(client, "U1")
+    reloads[0].join()
+    assert r._users.get("U1", ("",))[0] != "Dan"
+    assert r.sender(client, "U1") == "U1"

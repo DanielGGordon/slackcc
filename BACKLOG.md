@@ -42,3 +42,11 @@ sibling when wanted. T3 code integration deferred (see project notes).
 - Tests (mock the Slack client + backend.run_turn).
 - systemd unit / Docker for always-on running.
 - Telemetry: post session-complete/error summaries to a log channel.
+
+## Session ids survive a backend/project change
+`sessions.json` maps `channel:thread` -> session id with no note of which
+backend or project wrote it. Move a channel from `t3` to `claude` (or to
+another project) and an existing thread's next turn resumes an id that belongs
+to the old one -- after a restart as much as after a config reload (a reload
+only adds the case of a turn still in flight across the change). Fix: store
+`{backend, project, id}` and treat a mismatch as "no session".

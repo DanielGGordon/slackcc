@@ -160,6 +160,12 @@ class ConfigService:
         self.live.loaded = {**self.live.loaded, "etag": self.read_disk()["etag"]}
 
     def get(self) -> dict:
+        # Under the write lock: a GET never sees new senders with old channels
+        # halfway through a two-file write.
+        with self._lock:
+            return self._get_locked()
+
+    def _get_locked(self) -> dict:
         disk = self.read_disk()
         loaded = dict(self.live.loaded)
         return {
@@ -179,6 +185,15 @@ class ConfigService:
     # -- validating ------------------------------------------------------
 
     def _candidate(self, channels: dict, senders: dict | None) -> Settings:
+        if senders is None and self.live.current.guest_defaults is not None:
+            # No senders.json means "protection off: everyone is the owner".
+            # The running daemon has a sender policy, so a missing file is
+            # far likelier an accident (a deletion, a half-done replace) than
+            # a decision -- and a reload must never be how screening turns off.
+            raise ApiError(422, "senders_missing",
+                           "senders.json is missing but the running daemon has a sender "
+                           "policy; keeping it. To turn sender protection off, remove the "
+                           "file and restart slackcc.")
         try:
             candidate = with_config(self.live.current, channels, senders)
         except Exception as e:  # noqa: BLE001 - whatever the loader raises is a refusal
@@ -236,7 +251,7 @@ class ConfigService:
             new_etag = etag_of(texts["channels"], texts["senders"])
             self.live.swap(candidate, etag=new_etag, source="api")
             log.info("config applied via API (changed=%s, etag=%s)", changed, new_etag)
-        out = self.get()
+            out = self._get_locked()
         out["changed"] = changed
         return out
 
