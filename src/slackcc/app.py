@@ -15,9 +15,9 @@ from pathlib import Path
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-from . import backend, backend_t3, bridgedoc, t3_mirror
+from . import backend, backend_t3, bridgedoc, config_api, t3_mirror
 from .claims import ClaimStore
-from .config import ChannelConfig, SenderPolicy, Settings
+from .config import ChannelConfig, LiveSettings, SenderPolicy, Settings
 from .names import NameResolver
 from .outbound import scrub
 from .overrides import OverrideStore, parse_yes_no
@@ -189,7 +189,14 @@ class _ThreadLocks:
             return lock
 
 
-def build_app(settings: Settings) -> App:
+def build_app(config: Settings | LiveSettings) -> App:
+    """`config` is the Settings, or the LiveSettings holding them when the
+    routing map and sender policy can change under a running daemon
+    (config_api.py). Every event reads `live.current` ONCE and uses that
+    snapshot for the whole turn; `settings` below is the startup snapshot,
+    used only for what a reload never changes (tokens, paths, URLs)."""
+    live = config if isinstance(config, LiveSettings) else LiveSettings(config)
+    settings = live.current
     app = App(token=settings.bot_token)
     sessions = SessionStore(settings.sessions_path)
     claims = ClaimStore(claims_path())
@@ -201,6 +208,7 @@ def build_app(settings: Settings) -> App:
     # Configured sender names are reserved: an unconfigured Slack account
     # whose profile says "Dan" is shown by id, not as the owner.
     resolver = NameResolver(reserved={sp.name for sp in settings.senders.values()})
+    live.subscribe(lambda s: resolver.set_reserved({sp.name for sp in s.senders.values()}))
 
     auth = app.client.auth_test()
     bot_user_id = auth["user_id"]
@@ -215,11 +223,13 @@ def build_app(settings: Settings) -> App:
         # Outbound leg of the bidirectional flow: GUI-typed messages on
         # Slack-originated T3 threads get posted back into the Slack thread.
         t3_mirror.start(t3_client, app.client, mirror, settings.t3_owner)
+    live.t3_ready = t3_client is not None
 
     def handle(event: dict, say, client, logger, *, pps_override: bool = False) -> None:
         """`pps_override` is internal only (never from Slack): set when an
         owner re-dispatches a guest's screened-out message, so the judge is
         skipped for exactly that one message."""
+        settings = live.current  # one config for the whole turn, even across a reload
         # --- loop / noise prevention ---
         if event.get("bot_id") or event.get("subtype") in _IGNORED_SUBTYPES:
             return
@@ -560,7 +570,7 @@ def build_app(settings: Settings) -> App:
         """Post the in-thread "do you permit this?" question and remember the
         original event so a "yes" can replay it. No owners configured -> the
         denial stands silently, as before."""
-        owner_ids = settings.owner_ids()
+        owner_ids = live.current.owner_ids()
         if not owner_ids:
             return
         # Keep only what re-dispatch needs; Slack events carry blocks etc. that
@@ -637,11 +647,15 @@ def build_app(settings: Settings) -> App:
     app.event("message")(handle)
     app.event("app_mention")(handle)
     app.slackcc_handle = handle  # exposed for test harnesses
+    app.slackcc_live = live
     return app
 
 
 def run(settings: Settings) -> None:
-    app = build_app(settings)
+    live = LiveSettings(settings)
+    app = build_app(live)
+    # GET/PUT /config on loopback + SIGHUP reload: config changes without a restart.
+    config_api.start_from_env(live)
     handler = SocketModeHandler(app, settings.app_token)
     log.info("starting Socket Mode; %d channel(s) configured", len(settings.channels))
     handler.start()

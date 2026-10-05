@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
-from dataclasses import dataclass, field
+import threading
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -83,6 +86,9 @@ class Settings:
     pps_url: str = "http://127.0.0.1:8642"
     senders: dict[str, SenderPolicy] = field(default_factory=dict)
     guest_defaults: SenderPolicy | None = None
+    # Where senders came from; None only for Settings built by hand (tests).
+    # The config API (config_api.py) writes back to config_path + senders_path.
+    senders_path: Path | None = None
 
     def channel(self, channel_id: str) -> ChannelConfig | None:
         return self.channels.get(channel_id)
@@ -125,26 +131,83 @@ def _require_env(name: str) -> str:
     return val
 
 
-def load_channels(config_path: Path) -> dict[str, ChannelConfig]:
-    raw = json.loads(config_path.read_text())
+ROLES = ("owner", "guest")
+PPS_MODES = ("skip", "log", "enforce")
+
+
+def _nonempty_str(v: object) -> bool:
+    return isinstance(v, str) and bool(v.strip())
+
+
+def _str_field(spec: dict, key: str, where: str, *, default=None,
+               optional: bool = False, empty_ok: bool = False):
+    """spec[key] as a string; `default` when absent (or null, if `optional`)."""
+    if key not in spec or (optional and spec[key] is None):
+        return default
+    v = spec[key]
+    if not isinstance(v, str) or (not empty_ok and not v.strip()):
+        raise ValueError(f"{where}: {key} must be a non-empty string"
+                         + (" or null" if optional else ""))
+    return v
+
+
+def _seconds(spec: dict, key: str, default: int, where: str) -> int:
+    v = spec.get(key, default)
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        raise ValueError(f"{where}: {key} must be a whole number of seconds")
+    try:
+        n = int(v)
+    except (ValueError, OverflowError):
+        raise ValueError(f"{where}: {key} must be a whole number of seconds") from None
+    if n <= 0 or n != float(v):
+        raise ValueError(f"{where}: {key} must be a positive whole number of seconds")
+    return n
+
+
+def parse_channels(raw: dict) -> dict[str, ChannelConfig]:
+    """channels.json, already parsed. Raises (ValueError/KeyError/TypeError)
+    exactly where the daemon would refuse to start."""
+    if not isinstance(raw, dict):
+        raise ValueError("channels.json must be a JSON object")
     out: dict[str, ChannelConfig] = {}
-    for channel_id, spec in raw.get("channels", {}).items():
+    channels = raw.get("channels", {})
+    if not isinstance(channels, dict):
+        raise ValueError("channels.json: `channels` must be a JSON object")
+    for channel_id, spec in channels.items():
         if channel_id.startswith("_"):  # allow `_comment` style keys
             continue
+        # Types are checked here, not trusted: a value the parser lets through
+        # must not break a turn, or the next start (config_api.py writes what
+        # passes this).
+        where = f"channel {channel_id}"
+        if not isinstance(spec, dict):
+            raise ValueError(f"{where}: must be a JSON object")
+        if "project" not in spec or "cwd" not in spec:
+            raise ValueError(f"{where}: needs project and cwd")
+        t3_model = spec.get(
+            "t3_model", {"instanceId": "claudeAgent", "model": "claude-sonnet-5"}
+        )
+        if not (isinstance(t3_model, dict)
+                and all(_nonempty_str(t3_model.get(k)) for k in ("instanceId", "model"))):
+            raise ValueError(f"{where}: t3_model must be an object with string "
+                             "instanceId and model")
+        allowed_tools = spec.get("allowed_tools", [])
+        if not (isinstance(allowed_tools, list)
+                and all(isinstance(t, str) for t in allowed_tools)):
+            raise ValueError(f"{where}: allowed_tools must be a list of strings")
         cfg = ChannelConfig(
             channel_id=channel_id,
-            project=spec["project"],
-            cwd=os.path.expanduser(spec["cwd"]),
-            persona=spec.get("persona"),
-            allowed_tools=list(spec.get("allowed_tools", [])),
-            permission_mode=spec.get("permission_mode", "acceptEdits"),
-            timeout=int(spec.get("timeout", 600)),
-            approval_timeout=int(spec.get("approval_timeout", 3600)),
-            backend=spec.get("backend", "claude"),
-            t3_project_id=spec.get("t3_project_id"),
-            t3_model=spec.get(
-                "t3_model", {"instanceId": "claudeAgent", "model": "claude-sonnet-5"}
-            ),
+            project=_str_field(spec, "project", where),
+            cwd=os.path.expanduser(_str_field(spec, "cwd", where)),
+            persona=_str_field(spec, "persona", where, default=None, optional=True,
+                               empty_ok=True),
+            allowed_tools=list(allowed_tools),
+            permission_mode=_str_field(spec, "permission_mode", where, default="acceptEdits"),
+            timeout=_seconds(spec, "timeout", 600, where),
+            approval_timeout=_seconds(spec, "approval_timeout", 3600, where),
+            backend=_str_field(spec, "backend", where, default="claude"),
+            t3_project_id=_str_field(spec, "t3_project_id", where, default=None, optional=True),
+            t3_model=dict(t3_model),
             require_mention=bool(spec.get("require_mention", False)),
         )
         cfg.validate()
@@ -152,34 +215,98 @@ def load_channels(config_path: Path) -> dict[str, ChannelConfig]:
     return out
 
 
+def load_channels(config_path: Path) -> dict[str, ChannelConfig]:
+    return parse_channels(json.loads(config_path.read_text()))
+
+
+def parse_senders(raw: dict | None) -> tuple[dict[str, SenderPolicy], SenderPolicy | None]:
+    """senders.json, already parsed; None = no file (protection off)."""
+    if raw is None:
+        return {}, None
+    if not isinstance(raw, dict):
+        raise ValueError("senders.json must be a JSON object")
+
+    def _mk(user_id: str, spec: object, base_role: str, where: str) -> SenderPolicy:
+        if not isinstance(spec, dict):
+            raise ValueError(f"{where}: must be a JSON object")
+        role = _str_field(spec, "role", where, default=base_role)
+        owner = role == "owner"
+        sp = SenderPolicy(
+            user_id=user_id,
+            name=_str_field(spec, "name", where, default=user_id),
+            role=role,
+            runtime_mode=_str_field(spec, "runtime_mode", where,
+                                    default="full-access" if owner else "approval-required"),
+            pps_mode=_str_field(spec, "pps_mode", where,
+                                default="skip" if owner else "enforce"),
+            policy_extra=_str_field(spec, "policy_extra", where, default="", empty_ok=True),
+        )
+        # Every enum is checked, guest_defaults included: pps enforcement is
+        # `pps_mode == "enforce"`, so a typo would otherwise fail OPEN.
+        # (runtime_mode is only type-checked: it is legacy and never applied.)
+        if sp.role not in ROLES:
+            raise ValueError(f"{where}: unknown role {sp.role!r}")
+        if sp.pps_mode not in PPS_MODES:
+            raise ValueError(f"{where}: unknown pps_mode {sp.pps_mode!r}")
+        return sp
+
+    raw_senders = raw.get("senders", {})
+    if not isinstance(raw_senders, dict):
+        raise ValueError("senders.json: `senders` must be a JSON object")
+    senders = {uid: _mk(uid, spec, "guest", f"sender {uid}")
+               for uid, spec in raw_senders.items()
+               if not uid.startswith("_")}
+    guest_defaults = _mk("_default", raw.get("guest_defaults", {}), "guest", "guest_defaults")
+    if guest_defaults.role != "guest":
+        raise ValueError("guest_defaults: role must be guest")
+    return senders, guest_defaults
+
+
 def load_senders(path: Path) -> tuple[dict[str, SenderPolicy], SenderPolicy | None]:
     if not path.exists():
         return {}, None
-    raw = json.loads(path.read_text())
+    return parse_senders(json.loads(path.read_text()))
 
-    def _mk(user_id: str, spec: dict, base_role: str) -> SenderPolicy:
-        role = spec.get("role", base_role)
-        owner = role == "owner"
-        return SenderPolicy(
-            user_id=user_id,
-            name=spec.get("name", user_id),
-            role=role,
-            runtime_mode=spec.get("runtime_mode",
-                                  "full-access" if owner else "approval-required"),
-            pps_mode=spec.get("pps_mode", "skip" if owner else "enforce"),
-            policy_extra=spec.get("policy_extra", ""),
-        )
 
-    senders = {uid: _mk(uid, spec, "guest")
-               for uid, spec in raw.get("senders", {}).items()
-               if not uid.startswith("_")}
-    guest_defaults = _mk("_default", raw.get("guest_defaults", {}), "guest")
-    for sp in senders.values():
-        if sp.role not in ("owner", "guest"):
-            raise ValueError(f"sender {sp.user_id}: unknown role {sp.role!r}")
-        if sp.pps_mode not in ("skip", "log", "enforce"):
-            raise ValueError(f"sender {sp.user_id}: unknown pps_mode {sp.pps_mode!r}")
-    return senders, guest_defaults
+def check_settings(settings: Settings) -> None:
+    """Cross-checks between the routing map and the environment."""
+    if settings.has_t3_channels() and not settings.t3_token:
+        raise RuntimeError("A channel uses backend 't3' but SLACKCC_T3_TOKEN is not set")
+
+
+def with_config(settings: Settings, channels_raw: dict,
+                senders_raw: dict | None) -> Settings:
+    """The same Settings (tokens, URLs, paths from the environment) with a new
+    routing map and sender policy. Raises like load_settings() would."""
+    channels = parse_channels(channels_raw)
+    senders, guest_defaults = parse_senders(senders_raw)
+    out = replace(settings, channels=channels, senders=senders,
+                  guest_defaults=guest_defaults)
+    check_settings(out)
+    return out
+
+
+def effective(settings: Settings) -> dict:
+    """What the daemon is actually running with, defaults applied -- the one
+    source of truth for "what does an unset key mean" (Alfred's admin reads
+    this through GET /config instead of keeping its own defaults table)."""
+    def ch(c: ChannelConfig) -> dict:
+        return {"project": c.project, "cwd": c.cwd, "backend": c.backend,
+                "t3_project_id": c.t3_project_id, "t3_model": c.t3_model,
+                "permission_mode": c.permission_mode, "timeout": c.timeout,
+                "approval_timeout": c.approval_timeout,
+                "require_mention": c.require_mention}
+
+    def sp(p: SenderPolicy) -> dict:
+        return {"name": p.name, "role": p.role, "runtime_mode": p.runtime_mode,
+                "pps_mode": p.pps_mode, "policy_extra": p.policy_extra}
+
+    return {
+        "channels": {k: ch(v) for k, v in settings.channels.items()},
+        "senders": {k: sp(v) for k, v in settings.senders.items()},
+        "guest_defaults": sp(settings.guest_defaults)
+        if settings.guest_defaults is not None else None,
+    }
 
 
 def load_settings() -> Settings:
@@ -202,7 +329,49 @@ def load_settings() -> Settings:
         pps_url=os.environ.get("SLACKCC_PPS_URL", "http://127.0.0.1:8642"),
         senders=senders,
         guest_defaults=guest_defaults,
+        senders_path=senders_path,
     )
-    if settings.has_t3_channels() and not settings.t3_token:
-        raise RuntimeError("A channel uses backend 't3' but SLACKCC_T3_TOKEN is not set")
+    check_settings(settings)
     return settings
+
+
+class LiveSettings:
+    """The Settings a running daemon routes by, swappable without a restart.
+
+    Handlers read `.current` once per event and use that snapshot for the
+    whole turn, so a reload mid-turn never mixes two configs. Only the
+    routing map and sender policy ever change here (config_api.py); tokens,
+    URLs and paths stay what the process started with."""
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._lock = threading.Lock()
+        self._listeners: list = []
+        # Whether a T3 client exists in this process. build_app sets it; a
+        # config adding the FIRST t3 channel needs a restart, not a reload.
+        self.t3_ready = settings.has_t3_channels()
+        self.loaded: dict = {"etag": None, "at": _utc_now(), "source": "start"}
+
+    @property
+    def current(self) -> Settings:
+        return self._settings
+
+    def subscribe(self, fn) -> None:
+        """fn(new_settings) after every swap (e.g. the name resolver's reserved set)."""
+        with self._lock:
+            self._listeners.append(fn)
+
+    def swap(self, settings: Settings, *, etag: str | None, source: str) -> None:
+        with self._lock:
+            self._settings = settings
+            self.loaded = {"etag": etag, "at": _utc_now(), "source": source}
+            listeners = list(self._listeners)
+        for fn in listeners:
+            try:
+                fn(settings)
+            except Exception:  # noqa: BLE001 - a listener must not undo a reload
+                logging.getLogger(__name__).exception("settings listener failed")
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")

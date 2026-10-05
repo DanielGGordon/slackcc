@@ -83,6 +83,14 @@ class NameResolver:
         self._warned_users = False
         self._warned_channels = False
 
+    def set_reserved(self, reserved: set[str] | frozenset[str]) -> None:
+        """senders.json changed under a running daemon (config_api.py): the
+        new names are reserved from now on, and every cached user name is
+        dropped, since one may now collide with a configured sender."""
+        with self._lock:
+            self._reserved = {r.lower() for r in reserved}
+            self._users.clear()
+
     # -- cache helpers ----------------------------------------------------
 
     def _get(self, cache: dict[str, tuple[str, float | None]], key: str) -> str | None:
@@ -125,13 +133,18 @@ class NameResolver:
         name = _first_clean(profile.get("display_name"), profile.get("real_name"))
         if not name:
             name = self._lookup_user(client, user_id)
-        if name and name.lower() in self._reserved:
-            log.warning("sender %s has a profile name matching a configured "
-                        "sender (%r); showing the id instead", user_id, name)
-            name = ""
-        if not name:
-            return self._put(self._users, user_id, user_id, fallback=True)
-        return self._put(self._users, user_id, name, fallback=False)
+        # The reserved check and the cache write happen under one lock, so a
+        # reload (set_reserved) lands wholly before them (the check sees the
+        # new names) or wholly after (its clear() drops this entry).
+        with self._lock:
+            if name and name.lower() in self._reserved:
+                log.warning("sender %s has a profile name matching a configured "
+                            "sender (%r); showing the id instead", user_id, name)
+                name = ""
+            value, fallback = (name, False) if name else (user_id, True)
+            self._users[user_id] = (
+                value, time.monotonic() + FALLBACK_TTL if fallback else None)
+        return value
 
     def channel(self, client, channel_id: str, fallback: str) -> str:
         """Channel name without the `#`, or `fallback` (the configured project
