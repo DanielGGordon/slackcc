@@ -689,3 +689,219 @@ def test_long_thread_beyond_ledger_cap_does_not_repost_old_history(tmp_path):
     t3_mirror._sweep(t3, slack, mirror, owner="dan")
 
     assert slack.calls == []
+
+
+# --------------------------------------------------------------------------- #
+# customer-audience threads
+# --------------------------------------------------------------------------- #
+
+from types import SimpleNamespace  # noqa: E402
+
+from slackcc import customer  # noqa: E402
+from slackcc.config import ChannelConfig, SenderPolicy, Settings  # noqa: E402
+
+BLOCK_FINAL = "Edited the handler.\n\n### Message for the customer\nThe new price is on your booking page."
+BLOCK_ONLY = "The new price is on your booking page."
+
+
+class CustomerSlack(FakeSlack):
+    """FakeSlack that also hands out ts values and a permalink, like a real client."""
+
+    def chat_postMessage(self, **kwargs):
+        resp = super().chat_postMessage(**kwargs)
+        return {**resp, "ts": f"9{len(self.calls)}.0"}
+
+    def chat_getPermalink(self, **kwargs):
+        return {"permalink": "https://slack.example/p"}
+
+
+def customer_world(tmp_path, audience="customer"):
+    cfg = ChannelConfig(channel_id="C1", project="acme", cwd=str(tmp_path), backend="t3",
+                        t3_project_id="p", audience=audience)
+    settings = Settings(
+        bot_token="b", app_token="a", config_path=tmp_path / "c.json",
+        sessions_path=tmp_path / "s.json", claude_bin="claude", channels={"C1": cfg},
+        t3_gui_url="https://t3.example:7443",
+        senders={"Uown": SenderPolicy(user_id="Uown", name="Dan", role="owner")})
+    return SimpleNamespace(current=settings), customer.Ledger(tmp_path / "ledger")
+
+
+def sweep(tmp_path, proj, *, audience="customer", slack=None, mirror=None, ledger=None):
+    mirror = mirror or make_mirror(tmp_path)
+    live, fresh_ledger = customer_world(tmp_path, audience)
+    ledger = ledger or fresh_ledger
+    slack = slack or CustomerSlack()
+    t3_mirror._sweep(FakeT3Client({"t1": proj}), slack, mirror, owner="Dan",
+                     live=live, ledger=ledger)
+    return slack, mirror, ledger
+
+
+def ledger_of(ledger):
+    return ledger.recent(customer.thread_key("C1", "1000.0001"), 50)
+
+
+def dms(slack):
+    return [c for c in slack.calls if "thread_ts" not in c]
+
+
+def posts(slack):
+    return [c for c in slack.calls if "thread_ts" in c]
+
+
+def test_customer_thread_forwards_dans_gui_message_verbatim_as_dan(tmp_path):
+    proj = projection(runs=[run(status="running")],
+                      messages=[old_msg("u1", "user", "Please also check the footer")])
+    slack, mirror, ledger = sweep(tmp_path, proj)
+
+    [post] = posts(slack)
+    assert post["text"] == "*Dan:* Please also check the footer"
+    assert "agent" not in post["text"]
+    assert mirror.is_posted("t1", "u1")
+    [entry] = ledger_of(ledger)
+    assert entry["source"] == "dan_forward" and entry["text"] == "Please also check the footer"
+    assert entry["slack_ts"] and entry["t3_message_id"] == "u1"
+
+
+def test_technical_thread_keeps_the_said_to_the_agent_wording(tmp_path):
+    proj = projection(runs=[run(status="running")], messages=[old_msg("u1", "user", "hello")])
+    slack, _, ledger = sweep(tmp_path, proj, audience="technical")
+    assert [c["text"] for c in posts(slack)] == ["_Dan said to the agent:_ hello"]
+    assert ledger_of(ledger) == []
+
+
+def test_customer_forward_is_scrubbed_and_non_human_user_messages_never_forwarded(tmp_path):
+    token = "xoxb-" + "1234567890123-abcdefghijklmno"
+    proj = projection(runs=[run(status="running")], messages=[
+        old_msg("u1", "user", f"use {token}"),
+        old_msg("u2", "user", "subagent report", **AGENT),
+    ])
+    slack, mirror, _ = sweep(tmp_path, proj)
+    [post] = posts(slack)
+    assert token not in post["text"]
+    assert mirror.is_posted("t1", "u2")
+
+
+@pytest.mark.parametrize("text", ["#agent check the logs", "#AGENT: check the logs",
+                                  "  #agent\ncheck", "#agent"])
+def test_agent_prefixed_message_is_private_and_its_reply_is_not_posted(tmp_path, text):
+    proj = projection(
+        runs=[run(user_message_id="u1")],
+        messages=[old_msg("u1", "user", text, run_id=None),
+                  old_msg("a1", "assistant", BLOCK_FINAL)])
+    slack, mirror, ledger = sweep(tmp_path, proj)
+
+    assert slack.calls == []
+    assert mirror.is_posted("t1", "u1") and mirror.is_posted("t1", "a1")   # handled
+    assert ledger_of(ledger) == []
+
+
+def test_private_run_is_found_via_the_message_run_id_too(tmp_path):
+    proj = projection(
+        runs=[run(user_message_id="something-else")],
+        messages=[old_msg("u1", "user", "#agent look", run_id=RUN1),
+                  old_msg("a1", "assistant", BLOCK_FINAL)])
+    slack, mirror, _ = sweep(tmp_path, proj)
+    assert slack.calls == [] and mirror.is_posted("t1", "a1")
+
+
+def test_private_marker_needs_a_word_boundary(tmp_path):
+    proj = projection(runs=[run(user_message_id="u1")], messages=[
+        old_msg("u1", "user", "#agentic things are great", run_id=None),
+        old_msg("a1", "assistant", BLOCK_FINAL)])
+    slack, _, _ = sweep(tmp_path, proj)
+    assert [c["text"] for c in posts(slack)] == ["*Dan:* #agentic things are great", BLOCK_ONLY]
+
+
+def test_private_marker_from_a_non_human_message_does_not_silence_the_run(tmp_path):
+    # a subagent report that happens to start with #agent is not Dan
+    proj = projection(runs=[run(user_message_id="u9")], messages=[
+        old_msg("u1", "user", "#agent notes", run_id=RUN1, **AGENT),
+        old_msg("a1", "assistant", BLOCK_FINAL)])
+    slack, _, _ = sweep(tmp_path, proj)
+    assert [c["text"] for c in posts(slack)] == [BLOCK_ONLY]
+
+
+def test_gui_run_final_posts_only_the_block_and_ledgers_it(tmp_path):
+    proj = projection(runs=[run(user_message_id="u1")],
+                      messages=[old_msg("u1", "user", "add the price", run_id=None),
+                                old_msg("a1", "assistant", BLOCK_FINAL)])
+    slack, _, ledger = sweep(tmp_path, proj)
+
+    assert [c["text"] for c in posts(slack)] == ["*Dan:* add the price", BLOCK_ONLY]
+    assert "handler" not in posts(slack)[1]["text"]
+    assert [(e["source"], e.get("t3_message_id")) for e in ledger_of(ledger)] == [
+        ("dan_forward", "u1"), ("block", "a1")]
+
+
+def test_gui_run_without_a_block_posts_nothing_and_dms_owners_once(tmp_path):
+    proj = projection(runs=[run()], messages=[old_msg("a1", "assistant", "Fixed it in src/app.py")])
+    slack, mirror, ledger = sweep(tmp_path, proj)
+
+    assert posts(slack) == []
+    [dm] = dms(slack)
+    assert dm["channel"] == "Uown" and "no `### Message for the customer` block" in dm["text"]
+    assert "Fixed it in src/app.py" in dm["text"] and "https://slack.example/p" in dm["text"]
+    assert ledger_of(ledger) == []
+
+    sweep(tmp_path, proj, slack=slack, mirror=mirror, ledger=ledger)   # handled: no second DM
+    assert len(dms(slack)) == 1
+
+
+def test_gui_run_with_a_technical_block_posts_holding_line_and_dms_owners(tmp_path):
+    proj = projection(runs=[run()], messages=[old_msg(
+        "a1", "assistant", "tech\n### Message for the customer\nSee src/app.py, PR #4 merged.")])
+    slack, _, ledger = sweep(tmp_path, proj)
+
+    assert [c["text"] for c in posts(slack)] == [customer.HOLDING_LINE]
+    [dm] = dms(slack)
+    assert "looks technical" in dm["text"] and "src/app.py" in dm["text"]
+    assert [e["source"] for e in ledger_of(ledger)] == ["holding"]
+
+
+def test_user_role_message_with_the_marker_is_never_the_block(tmp_path):
+    """Subagent reports are user-role and may carry the marker; only the run's
+    final ASSISTANT message is parsed."""
+    proj = projection(runs=[run()], messages=[
+        old_msg("u1", "user", "report\n### Message for the customer\nLeaked!", **AGENT),
+        old_msg("a1", "assistant", "All done, plain technical summary."),
+    ])
+    slack, _, _ = sweep(tmp_path, proj)
+    assert all("Leaked" not in c["text"] for c in slack.calls)
+    assert posts(slack) == []   # the assistant message had no block
+
+
+def test_customer_block_is_scrubbed_and_last_marker_wins(tmp_path):
+    token = "xoxb-" + "1234567890123-abcdefghijklmno"
+    final = ("### Message for the customer\nold draft\n\nnotes\n\n"
+             f"### Message for the customer\nKey was {token}")
+    proj = projection(runs=[run()], messages=[old_msg("a1", "assistant", final)])
+    slack, _, _ = sweep(tmp_path, proj)
+    [post] = posts(slack)
+    assert post["text"].startswith("Key was ") and token not in post["text"]
+
+
+def test_customer_threads_keep_the_grace_period(tmp_path):
+    fresh = projection(runs=[run()], messages=[old_msg("a1", "assistant", BLOCK_FINAL, age=1.0)])
+    slack, _, _ = sweep(tmp_path, fresh)
+    assert slack.calls == []
+
+
+def test_customer_threads_keep_ledger_dedupe_against_the_slack_turn(tmp_path):
+    done = projection(runs=[run()], messages=[old_msg("a1", "assistant", BLOCK_FINAL)])
+    mirror = make_mirror(tmp_path)
+    mirror.mark_posted("t1", ["a1"])   # the Slack turn already posted it
+    slack, _, _ = sweep(tmp_path, done, mirror=mirror)
+    assert slack.calls == []
+
+
+def test_channel_not_in_live_settings_is_treated_as_technical(tmp_path):
+    mirror = make_mirror(tmp_path, channel="Cunknown")
+    proj = projection(runs=[run()], messages=[old_msg("a1", "assistant", "plain old reply")])
+    slack, _, _ = sweep(tmp_path, proj, mirror=mirror)
+    assert [c["text"] for c in slack.calls] == ["plain old reply"]
+
+
+def test_settle_notice_still_fires_on_customer_threads(tmp_path):
+    proj = projection(settledOverride="settled", settledAt=iso_now_minus(5))
+    slack, _, _ = sweep(tmp_path, proj)
+    assert "settled this chat" in posts(slack)[0]["text"]
