@@ -51,6 +51,10 @@ class TurnResult:
     # t3 backend only: a human `#agent` message was steered into this run, so
     # its reply is for the owner alone and must not be posted to Slack.
     private: bool = False
+    # t3 backend only: the run failed because the session's context window is
+    # too full for T3 to re-inject history ("Insufficient context allowance
+    # for the provider handoff"). A `/compact` clears it.
+    context_full: bool = False
 
 
 def _build_options(

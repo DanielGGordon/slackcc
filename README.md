@@ -41,6 +41,11 @@ Slack channel ──(Socket Mode)──> slackcc daemon ──┬──> backend
   `approval_timeout` (default 3600s) the bridge posts a "waiting for approval"
   note and lets go of the thread *without* interrupting the T3 turn, so it can
   still be approved later; the mirror delivers the eventual reply.
+- **Full sessions self-heal:** a long thread can fill the model's context window,
+  after which T3 refuses every new message ("Insufficient context allowance for
+  the provider handoff"). The `t3` backend spots that failure, sends `/compact`
+  into the thread, and retries the same prompt once. A failed compaction or a
+  second failure is reported as usual -- never a loop.
 - **Owner override for screened messages:** when pps declines a guest's
   message (`enforce` mode), the bot posts the denial and then asks the owners
   in the same thread, quoting the request so it's unambiguous what a "yes"

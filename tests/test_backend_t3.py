@@ -1054,3 +1054,91 @@ def test_ordinary_run_is_not_private(tmp_path, monkeypatch):
     thread_id = "t3-thread-not-private"
     mirror = make_mirror(tmp_path, thread_id)
     assert go(FakeT3Client(projections=[completed()]), mirror, thread_id).private is False
+
+
+# --- auto-compact on a full session -----------------------------------------
+
+FULL_ERROR = {"id": "err-1", "type": "error", "runId": RUN_ID, "failure": {
+    "message": "Insufficient context allowance for the provider handoff. Compact the "
+               "target conversation or use a larger-context model; the current request "
+               "has not been truncated."}}
+
+
+def context_full():
+    return lambda mid: projection(mid, "failed", reply=None, items=[FULL_ERROR])
+
+
+def message_texts(client):
+    return [c["text"] for k, c in client.calls
+            if k == "dispatch" and c["type"] == "message.dispatch"]
+
+
+def test_context_full_failure_is_flagged(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    mirror = make_mirror(tmp_path, "t-full")
+    client = FakeT3Client(projections=[context_full()])
+    result = backend_t3._run_once(prompt="hi", thread_id="t-full", is_new=False,
+                                  project_id="p", model={}, title="t", client=client,
+                                  mirror=mirror)
+    assert result.ok is False and result.context_full is True
+
+
+def test_other_failures_are_not_flagged(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    mirror = make_mirror(tmp_path, "t-other")
+    other = {"id": "e", "type": "error", "runId": RUN_ID, "failure": {"message": "boom"}}
+    client = FakeT3Client(projections=[
+        lambda mid: projection(mid, "failed", reply=None, items=[other])])
+    assert go(client, mirror, "t-other").context_full is False
+
+
+def test_full_session_is_compacted_then_the_prompt_retried(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    mirror = make_mirror(tmp_path, "t-compact")
+    client = FakeT3Client(projections=[
+        context_full(),
+        completed(reply=None),
+        completed(reply="done after compact", reply_id="assist-ok"),
+    ])
+    progress = []
+
+    result = go(client, mirror, "t-compact", prompt="roll the dice",
+                on_progress=progress.append)
+
+    assert message_texts(client) == ["roll the dice", "/compact", "roll the dice"]
+    assert result.ok is True and result.text == "done after compact"
+    assert len(progress) == 1 and "tidying" in progress[0]
+
+
+def test_failed_compaction_returns_the_original_failure(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    mirror = make_mirror(tmp_path, "t-compact-fail")
+    client = FakeT3Client(projections=[
+        context_full(),
+        lambda mid: projection(mid, "failed", reply=None),
+    ])
+
+    result = go(client, mirror, "t-compact-fail", prompt="roll the dice")
+
+    assert message_texts(client) == ["roll the dice", "/compact"]
+    assert result.ok is False and result.context_full is True
+
+
+def test_still_full_after_compaction_does_not_loop(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    mirror = make_mirror(tmp_path, "t-compact-twice")
+    client = FakeT3Client(projections=[context_full(), completed(reply=None), context_full()])
+
+    result = go(client, mirror, "t-compact-twice", prompt="roll the dice")
+
+    assert message_texts(client) == ["roll the dice", "/compact", "roll the dice"]
+    assert result.ok is False
+
+
+def test_retry_does_not_recreate_a_new_thread_or_resend_images(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    mirror = make_mirror(tmp_path, "t-new-full")
+    client = FakeT3Client(projections=[context_full(), completed(reply=None),
+                                       completed(reply="ok", reply_id="a")])
+    go(client, mirror, "t-new-full", is_new=True)
+    assert client.dispatch_types().count("thread.create") == 1
