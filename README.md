@@ -60,7 +60,9 @@ Slack channel ──(Socket Mode)──> slackcc daemon ──┬──> backend
   still declined. State: `.state/pps_overrides.json`.
 - **Bidirectional mirror (t3 backend):** messages typed into the T3 GUI on a
   Slack-originated thread are posted back into the Slack thread
-  ("_Owner said to the agent:_ …"), and replies land in both places. Settling
+  ("_Owner said to the agent:_ …"), and replies land in both places. Only
+  messages T3 records as human-typed (web/mobile) get that label; agent text
+  T3 files as a user message (subagent reports, agent sends) is not posted. Settling
   a chat in the T3 UI posts a notice into the Slack thread; replying in Slack
   un-settles it.
 - **Outbound scrubbing:** every message posted to Slack is scanned and

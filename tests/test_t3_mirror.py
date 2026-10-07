@@ -63,9 +63,16 @@ def run(run_id: str = RUN1, status: str = "completed", user_message_id: str = "u
     return {"id": run_id, "status": status, "userMessageId": user_message_id}
 
 
+# Origin stamps as T3 writes them: a GUI-typed user message, and agent output.
+GUI = {"createdBy": "user", "creationSource": "web"}
+AGENT = {"createdBy": "agent", "creationSource": "provider"}
+
+
 def old_msg(mid: str, role: str, text: str, streaming: bool = False, age: float = 60.0,
-            run_id: str | None = RUN1) -> dict:
+            run_id: str | None = RUN1, **origin) -> dict:
     return {
+        **(GUI if role == "user" else AGENT),
+        **origin,
         "id": mid,
         "role": role,
         "runId": run_id,
@@ -259,6 +266,76 @@ def test_user_message_posts_without_any_completed_run(tmp_path):
 
     assert [c["text"] for c in slack.calls] == ["_dan said to the agent:_ do the thing"]
     assert mirror.is_posted("t1", "u1") is True
+
+
+def test_subagent_report_relayed_as_user_message_is_not_attributed_to_owner(tmp_path):
+    """Regression: T3 relays a finished subagent's report into the parent
+    thread as a role-"user" message. It was posted as "<owner> said to the
+    agent: Committed as ..." -- words the owner never typed."""
+    mirror = make_mirror(tmp_path)
+    report = old_msg(
+        "message:thread:t1:ordinal:1:0d80054f", "user",
+        "Committed as `56538f3` (not pushed, no PR opened, per instructions).",
+        run_id=RUN2, createdBy="agent", creationSource="provider",
+        notification={"source": {"kind": "background_task", "work": "subagent"},
+                      "outcome": "completed", "summary": 'Subagent "Task4" finished'},
+    )
+    proj = projection(
+        runs=[run(RUN1, "completed"), run(RUN2, "completed", report["id"])],
+        messages=[old_msg("u1", "user", "use a subagent per task", run_id=RUN1),
+                  report,
+                  old_msg("a2", "assistant", "Task 4 is done.", run_id=RUN2)],
+    )
+    t3 = FakeT3Client({"t1": proj})
+    slack = FakeSlack()
+
+    t3_mirror._sweep(t3, slack, mirror, owner="Dan")
+    t3_mirror._sweep(t3, slack, mirror, owner="Dan")
+
+    texts = [c["text"] for c in slack.calls]
+    assert texts == ["_Dan said to the agent:_ use a subagent per task", "Task 4 is done."]
+    assert not any("Committed" in t for t in texts)
+    # Decided once: ledgered so later sweeps don't re-examine it.
+    assert mirror.is_posted("t1", report["id"]) is True
+
+
+@pytest.mark.parametrize("origin", [
+    pytest.param({"createdBy": "agent", "creationSource": "provider"}, id="provider-agent"),
+    pytest.param({"createdBy": "agent", "creationSource": "mcp", "senderThreadId": "t0"},
+                 id="agent-send-via-mcp"),
+    pytest.param({"createdBy": "agent", "creationSource": "provider", "senderThreadId": "t0"},
+                 id="subagent-task-prompt"),
+    pytest.param({"createdBy": "system", "creationSource": "server"}, id="system"),
+    pytest.param({"createdBy": "user", "creationSource": "server"}, id="v1-import"),
+    pytest.param({"createdBy": "user", "creationSource": "web", "scheduledTaskId": "st1"},
+                 id="scheduled-task"),
+    pytest.param({"createdBy": "user", "creationSource": "web", "senderThreadId": "t0"},
+                 id="web-but-sent-by-another-thread"),
+    pytest.param({"createdBy": None, "creationSource": None}, id="origin-unknown"),
+])
+def test_non_human_user_message_never_posted_as_owner(tmp_path, origin):
+    mirror = make_mirror(tmp_path)
+    proj = projection(messages=[old_msg("u1", "user", "not from a person", run_id=None,
+                                        **origin)])
+    t3 = FakeT3Client({"t1": proj})
+    slack = FakeSlack()
+
+    t3_mirror._sweep(t3, slack, mirror, owner="dan")
+
+    assert slack.calls == []
+
+
+@pytest.mark.parametrize("source", ["web", "mobile"])
+def test_human_typed_user_message_from_any_t3_client_is_attributed(tmp_path, source):
+    mirror = make_mirror(tmp_path)
+    proj = projection(messages=[old_msg("u1", "user", "ship it", run_id=None,
+                                        creationSource=source)])
+    t3 = FakeT3Client({"t1": proj})
+    slack = FakeSlack()
+
+    t3_mirror._sweep(t3, slack, mirror, owner="dan")
+
+    assert [c["text"] for c in slack.calls] == ["_dan said to the agent:_ ship it"]
 
 
 def test_grace_period_skips_fresh_message_and_does_not_ledger(tmp_path):

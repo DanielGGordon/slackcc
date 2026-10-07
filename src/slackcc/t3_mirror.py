@@ -5,6 +5,9 @@ Slack-originated thread in the T3 GUI, that turn should surface in Slack too —
 the user's message as "*<owner> said to the agent:* ..." and the assistant's
 reply as a normal bot post. Slack-originated messages never re-post: the turn
 backend ledgers their ids in `MirrorStore` before/right after each turn.
+Only a user-role message T3 marks as human-typed (`t3.typed_by_human`) is
+attributed to the owner; T3 also files agent text under role "user" (subagent
+reports, agent-to-agent sends), and those are skipped, never posted.
 
 Design constraints:
 - Poll-only. T3 has no self-hosted webhook; WS subscribe is a later upgrade.
@@ -26,7 +29,7 @@ from datetime import datetime, timezone
 from slack_sdk import WebClient
 
 from .outbound import scrub
-from .t3 import MirrorStore, T3Client, T3Error, final_reply
+from .t3 import MirrorStore, T3Client, T3Error, final_reply, typed_by_human
 
 log = logging.getLogger(__name__)
 
@@ -91,6 +94,15 @@ def _sweep(t3: T3Client, slack: WebClient, mirror: MirrorStore, owner: str) -> N
             if _age_secs(msg.get("updatedAt", "")) < _GRACE_SECS:
                 continue
             if mirror.is_posted(thread_id, mid):
+                continue
+            if role == "user" and not typed_by_human(msg):
+                # Agent-authored (e.g. a subagent's report relayed into the
+                # thread) or of unknown origin: never "<owner> said". Ledgered
+                # so the skip is decided and logged once.
+                log.info("mirror: skipping non-human user message %s on %s "
+                         "(createdBy=%s source=%s)", mid, thread_id,
+                         msg.get("createdBy"), msg.get("creationSource"))
+                mirror.mark_posted(thread_id, [mid])
                 continue
             text = (msg.get("text") or "").strip()
             if not text:
