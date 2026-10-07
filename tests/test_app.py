@@ -987,6 +987,13 @@ def test_bridge_header_carries_role_when_known():
     assert bridge_header("C1", "1.2", "owner").endswith("role=owner -->")
 
 
+def test_bridge_header_carries_audience_alongside_role():
+    assert (bridge_header("C1", "1.2", "guest", "customer")
+            == "<!-- slack channel=C1 thread=1.2 role=guest audience=customer -->")
+    assert (bridge_header("C1", "1.2", "owner", "technical")
+            == "<!-- slack channel=C1 thread=1.2 role=owner audience=technical -->")
+
+
 # --------------------------------------------------------------------------- #
 # attribution(): the line the human reads in the T3 GUI
 # --------------------------------------------------------------------------- #
@@ -1051,7 +1058,7 @@ def test_handle_claude_backend_system_prompt_has_persona_protocol_and_header(mak
     # The protocol is free on this backend: system prompt, every turn, and it
     # never touches the message the channel shows.
     assert bridgedoc.render() in system_prompt
-    assert bridge_header("Cclaude", "90.2", "owner") in system_prompt
+    assert bridge_header("Cclaude", "90.2", "owner", "technical") in system_prompt
     assert SAFETY_PREAMBLE not in system_prompt
     assert system_prompt.index("Foo-bot") < system_prompt.index("<!-- slack channel=")
 
@@ -1110,7 +1117,7 @@ def test_handle_t3_thin_prompt_when_the_project_carries_the_protocol(make_env):
     assert len(env.backend_t3_calls) == 1
     call = env.backend_t3_calls[0]
     assert call["is_new"] is True
-    assert call["prompt"] == f'{bridge_header("Ct3", "90.3", "owner")}\n\nDan from #sofer-ai: hi'
+    assert call["prompt"] == f'{bridge_header("Ct3", "90.3", "owner", "technical")}\n\nDan from #sofer-ai: hi'
     assert call["title"] == "#sofer-ai: hi"  # no ids in the GUI title either
 
 
@@ -1123,7 +1130,7 @@ def test_handle_t3_injects_protocol_inline_when_project_uninstalled(make_env):
     # Fallback: the agent still gets the protocol, just not for free.
     prompt = env.backend_t3_calls[0]["prompt"]
     assert prompt == (
-        f'{bridge_header("Ct3", "90.9", "owner")}\n\n{bridgedoc.render()}\n\nDan from #sofer-ai: hi'
+        f'{bridge_header("Ct3", "90.9", "owner", "technical")}\n\n{bridgedoc.render()}\n\nDan from #sofer-ai: hi'
     )
 
 
@@ -1156,7 +1163,7 @@ def test_handle_t3_resume_never_pays_for_the_protocol(make_env):
     assert call["is_new"] is False
     assert call["thread_id"] == "existing-thread-id"
     # A resumed thread already knows its channel: name only.
-    assert call["prompt"] == f'{bridge_header("Ct3", "90.4", "owner")}\n\nDan: hi again'
+    assert call["prompt"] == f'{bridge_header("Ct3", "90.4", "owner", "technical")}\n\nDan: hi again'
 
 
 # --------------------------------------------------------------------------- #
@@ -1240,7 +1247,7 @@ def test_handle_t3_unscreened_guest_gets_the_guard_inline(make_env):
 
     assert len(env.backend_t3_calls) == 1
     prompt = env.backend_t3_calls[0]["prompt"]
-    assert prompt.startswith(bridge_header("Ct3", "90.7", "guest"))
+    assert prompt.startswith(bridge_header("Ct3", "90.7", "guest", "technical"))
     assert SAFETY_PREAMBLE in prompt
     assert wrap_untrusted("slack", "Ulogger", "hi") in prompt
 

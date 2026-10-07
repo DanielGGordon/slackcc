@@ -165,6 +165,7 @@ def test_load_channels_defaults(tmp_path):
     assert cfg.allowed_tools == []
     assert cfg.backend == "claude"
     assert cfg.require_mention is False
+    assert cfg.audience == "technical"
     assert cfg.approval_timeout == 3600
 
 
@@ -186,6 +187,28 @@ def test_load_channels_require_mention_true(tmp_path):
     )
     cfg = load_channels(config_path)["C123"]
     assert cfg.require_mention is True
+
+
+def test_load_channels_audience(tmp_path):
+    (tmp_path / "p").mkdir()
+    config_path = tmp_path / "channels.json"
+    _write_json(config_path, {"channels": {
+        "C1": {"project": "a", "cwd": str(tmp_path / "p"), "audience": "customer"},
+        "C2": {"project": "b", "cwd": str(tmp_path / "p"), "audience": "technical"},
+    }})
+    channels = load_channels(config_path)
+    assert channels["C1"].audience == "customer"
+    assert channels["C2"].audience == "technical"
+
+
+@pytest.mark.parametrize("bad", ["public", "", "Customer", 3, None, ["customer"]])
+def test_load_channels_rejects_a_bad_audience(tmp_path, bad):
+    (tmp_path / "p").mkdir()
+    config_path = tmp_path / "channels.json"
+    _write_json(config_path, {"channels": {
+        "C1": {"project": "a", "cwd": str(tmp_path / "p"), "audience": bad}}})
+    with pytest.raises(ValueError, match="audience"):
+        load_channels(config_path)
 
 
 # ---------------------------------------------------------------------------

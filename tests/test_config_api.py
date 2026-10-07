@@ -77,6 +77,7 @@ def test_get_returns_files_effective_and_etag(world):
     assert list(out["effective"]["channels"]) == ["C1"]
     c1 = out["effective"]["channels"]["C1"]
     assert c1["timeout"] == 600 and c1["require_mention"] is False
+    assert c1["audience"] == "technical"
     assert c1["t3_model"] == {"instanceId": "claudeAgent", "model": "claude-sonnet-5"}
     assert out["effective"]["senders"]["UOWNER1"]["runtime_mode"] == "full-access"
     assert out["effective"]["senders"]["UOWNER1"]["pps_mode"] == "skip"
@@ -141,6 +142,14 @@ def test_put_keeps_comments_and_muted_keys(world):
     assert world.live.current.channel("C1").require_mention is True
 
 
+def test_put_audience_goes_live_without_a_restart(world):
+    channels = json.loads(world.channels_path.read_text())
+    channels["channels"]["C1"]["audience"] = "customer"
+    out = world.service.put({"if_match": _etag(world), "channels": channels})
+    assert world.live.current.channel("C1").audience == "customer"
+    assert out["effective"]["channels"]["C1"]["audience"] == "customer"
+
+
 def test_put_dry_run_returns_the_candidate_and_writes_nothing(world):
     before = (world.channels_path.read_text(), world.senders_path.read_text())
     senders = json.loads(before[1])
@@ -181,6 +190,8 @@ def test_put_stale_etag_is_refused(world):
     (lambda c, s: c["channels"]["C1"].update(allowed_tools="Read"), "allowed_tools"),
     (lambda c, s: c["channels"]["C1"].update(project=None), "project must be a non-empty string"),
     (lambda c, s: c.update(channels=[]), "`channels` must be a JSON object"),
+    (lambda c, s: c["channels"]["C1"].update(audience="public"), "unknown audience"),
+    (lambda c, s: c["channels"]["C1"].update(audience=3), "audience must be a non-empty string"),
 ])
 def test_put_invalid_is_refused_and_nothing_changes(world, mutate, needle):
     channels, senders = json.loads(world.channels_path.read_text()), json.loads(world.senders_path.read_text())

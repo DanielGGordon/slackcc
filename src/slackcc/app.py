@@ -41,7 +41,8 @@ _IGNORED_SUBTYPES = {
 _MAX_T3_ATTACHMENTS = 8
 
 
-def bridge_header(channel_id: str, thread_ts: str, role: str | None = None) -> str:
+def bridge_header(channel_id: str, thread_ts: str, role: str | None = None,
+                  audience: str | None = None) -> str:
     """All a turn needs once the agent knows the protocol: which thread it is.
 
     An HTML comment on purpose: the T3 GUI renders user messages through
@@ -54,8 +55,10 @@ def bridge_header(channel_id: str, thread_ts: str, role: str | None = None) -> s
     project's CLAUDE.md (t3 backend) -- see bridgedoc.py.
 
     `role` (owner|guest) is appended when known; a comment without it means
-    owner, so older/other callers keep parsing and behaving as before."""
-    tail = f" role={role}" if role else ""
+    owner, so older/other callers keep parsing and behaving as before.
+    `audience` (customer|technical) is the channel's, not the sender's; a
+    comment without it means technical."""
+    tail = (f" role={role}" if role else "") + (f" audience={audience}" if audience else "")
     return f"<!-- slack channel={channel_id} thread={thread_ts}{tail} -->"
 
 
@@ -312,7 +315,7 @@ def build_app(config: Settings | LiveSettings) -> App:
         # that case still pays for fencing + the security directive.
         screened = sp.role == "owner" or sp.pps_mode == "enforce"
 
-        header = bridge_header(channel_id, thread_ts, sp.role)
+        header = bridge_header(channel_id, thread_ts, sp.role, cfg.audience)
         guard = None if screened else SAFETY_PREAMBLE
         # claude backend: the protocol is free here -- system prompt, every
         # turn, invisible in the channel. Nothing to install.

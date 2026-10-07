@@ -11,6 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+AUDIENCES = ("technical", "customer")
+
+
 @dataclass(frozen=True)
 class ChannelConfig:
     """Routing + scoping for one Slack channel."""
@@ -41,6 +44,12 @@ class ChannelConfig:
     # and the bot should only speak up when actually @-mentioned or replying
     # in a thread it already joined -- see app.py's handle() for the gating.
     require_mention: bool = False
+    # Who reads this channel: "technical" (default) = the owner-style channel,
+    # replies stay as the agent wrote them. "customer" = non-coders: every turn
+    # runs in customer mode -- the agent ends with a marked plain-language block
+    # and only that block reaches Slack (customer.py). A property of the
+    # channel, not the sender: even a turn Dan triggers from Slack is customer-voiced.
+    audience: str = "technical"
 
     def validate(self) -> None:
         if not Path(self.cwd).is_dir():
@@ -49,6 +58,8 @@ class ChannelConfig:
             )
         if self.backend not in ("claude", "t3"):
             raise ValueError(f"channel {self.channel_id}: unknown backend {self.backend!r}")
+        if self.audience not in AUDIENCES:
+            raise ValueError(f"channel {self.channel_id}: unknown audience {self.audience!r}")
         if self.backend == "t3" and not self.t3_project_id:
             raise ValueError(f"channel {self.channel_id}: backend 't3' needs t3_project_id")
 
@@ -237,6 +248,7 @@ def parse_channels(raw: dict) -> dict[str, ChannelConfig]:
             t3_project_id=_str_field(spec, "t3_project_id", where, default=None, optional=True),
             t3_model=dict(t3_model),
             require_mention=bool(spec.get("require_mention", False)),
+            audience=_str_field(spec, "audience", where, default="technical"),
         )
         cfg.validate()
         out[channel_id] = cfg
@@ -324,7 +336,7 @@ def effective(settings: Settings) -> dict:
                 "t3_project_id": c.t3_project_id, "t3_model": c.t3_model,
                 "permission_mode": c.permission_mode, "timeout": c.timeout,
                 "approval_timeout": c.approval_timeout,
-                "require_mention": c.require_mention}
+                "require_mention": c.require_mention, "audience": c.audience}
 
     def sp(p: SenderPolicy) -> dict:
         return {"name": p.name, "role": p.role, "runtime_mode": p.runtime_mode,
