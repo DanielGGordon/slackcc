@@ -15,7 +15,7 @@ from pathlib import Path
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-from . import backend, backend_t3, bridgedoc, config_api, t3_mirror
+from . import backend, backend_t3, bridgedoc, config_api, customer, t3_mirror
 from .claims import ClaimStore
 from .config import ChannelConfig, LiveSettings, SenderPolicy, Settings
 from .names import NameResolver
@@ -41,7 +41,8 @@ _IGNORED_SUBTYPES = {
 _MAX_T3_ATTACHMENTS = 8
 
 
-def bridge_header(channel_id: str, thread_ts: str) -> str:
+def bridge_header(channel_id: str, thread_ts: str, role: str | None = None,
+                  audience: str | None = None) -> str:
     """All a turn needs once the agent knows the protocol: which thread it is.
 
     An HTML comment on purpose: the T3 GUI renders user messages through
@@ -51,8 +52,14 @@ def bridge_header(channel_id: str, thread_ts: str) -> str:
     Same form on the claude backend (system prompt) so there's one format.
 
     The protocol itself comes from the system prompt (claude backend) or the
-    project's CLAUDE.md (t3 backend) -- see bridgedoc.py."""
-    return f"<!-- slack channel={channel_id} thread={thread_ts} -->"
+    project's CLAUDE.md (t3 backend) -- see bridgedoc.py.
+
+    `role` (owner|guest) is appended when known; a comment without it means
+    owner, so older/other callers keep parsing and behaving as before.
+    `audience` (customer|technical) is the channel's, not the sender's; a
+    comment without it means technical."""
+    tail = (f" role={role}" if role else "") + (f" audience={audience}" if audience else "")
+    return f"<!-- slack channel={channel_id} thread={thread_ts}{tail} -->"
 
 
 def attribution(name: str, channel_name: str, text: str, *,
@@ -206,6 +213,9 @@ def build_app(config: Settings | LiveSettings) -> App:
     # rather than going through paths.py like the shared claims file.
     overrides = OverrideStore(settings.sessions_path.parent / "pps_overrides.json")
     seen = _SeenSet()
+    # What each customer-channel Slack thread has been told (customer.py);
+    # daemon-only state, so it sits next to sessions.json like the files above.
+    ledger = customer.Ledger(settings.sessions_path.parent / "customer_ledger")
     # Configured sender names are reserved: an unconfigured Slack account
     # whose profile says "Dan" is shown by id, not as the owner.
     resolver = NameResolver(reserved={sp.name for sp in settings.senders.values()})
@@ -223,7 +233,8 @@ def build_app(config: Settings | LiveSettings) -> App:
         mirror = MirrorStore(settings.sessions_path.parent / "t3_mirror.json")
         # Outbound leg of the bidirectional flow: GUI-typed messages on
         # Slack-originated T3 threads get posted back into the Slack thread.
-        t3_mirror.start(t3_client, app.client, mirror, settings.t3_owner)
+        t3_mirror.start(t3_client, app.client, mirror, settings.t3_owner,
+                        live=live, ledger=ledger)
     live.t3_ready = t3_client is not None
 
     def handle(event: dict, say, client, logger, *, pps_override: bool = False) -> None:
@@ -308,7 +319,7 @@ def build_app(config: Settings | LiveSettings) -> App:
         # that case still pays for fencing + the security directive.
         screened = sp.role == "owner" or sp.pps_mode == "enforce"
 
-        header = bridge_header(channel_id, thread_ts)
+        header = bridge_header(channel_id, thread_ts, sp.role, cfg.audience)
         guard = None if screened else SAFETY_PREAMBLE
         # claude backend: the protocol is free here -- system prompt, every
         # turn, invisible in the channel. Nothing to install.
@@ -347,6 +358,16 @@ def build_app(config: Settings | LiveSettings) -> App:
         thread_lock.acquire()
         resume = sessions.get(channel_id, thread_ts)
 
+        # Customer channel: this turn runs in customer mode whoever sent it.
+        # Remind the agent what the customer has been told so far (it survives
+        # context compaction, and doubles as Dan's audit trail in T3).
+        customer_mode = cfg.audience == "customer"
+        ledger_key = customer.thread_key(channel_id, thread_ts)
+        if customer_mode:
+            told = ledger.note(ledger_key)
+            if told:
+                prompt = f"{told}\n\n{prompt}"
+
         log.info("dispatch channel=%s project=%s user=%s resume=%s",
                  channel_id, cfg.project, user, bool(resume))
 
@@ -360,12 +381,13 @@ def build_app(config: Settings | LiveSettings) -> App:
         except Exception:  # noqa: BLE001 - never let feedback break the turn
             logger.warning("could not post placeholder", exc_info=True)
 
-        def finish(final_text: str) -> None:
+        def finish(final_text: str) -> str | None:
+            """Post the final text; returns the Slack ts it landed at."""
             final_text = scrub(final_text)[0]
             if placeholder_ts:
                 client.chat_update(channel=channel_id, ts=placeholder_ts, text=final_text)
-            else:
-                say(text=final_text, thread_ts=thread_ts)
+                return placeholder_ts
+            return (say(text=final_text, thread_ts=thread_ts) or {}).get("ts")
 
         try:
             # --- pps gate: blocking prompt-protection screen for non-owner senders ---
@@ -461,6 +483,11 @@ def build_app(config: Settings | LiveSettings) -> App:
                 def progress(update: str) -> None:
                     if not placeholder_ts:
                         return
+                    if customer_mode:
+                        # Already customer-safe and carrying its own elapsed time.
+                        client.chat_update(channel=channel_id, ts=placeholder_ts,
+                                           text=scrub(update)[0][:3900])
+                        return
                     mins, secs = divmod(int(time.monotonic() - turn_started), 60)
                     body = scrub(update)[0]
                     client.chat_update(
@@ -503,7 +530,9 @@ def build_app(config: Settings | LiveSettings) -> App:
                     thread_id=thread_id,
                     is_new=resume is None,
                     project_id=cfg.t3_project_id or "",
-                    model=cfg.t3_model,
+                    # Only read when this turn creates the thread: T3 fixes the model
+                    # then, so whoever STARTS a thread decides it for good.
+                    model=settings.t3_model_for(sp, cfg),
                     images=attachments,
                     title=f"#{channel_name}: {' '.join((text or 'attachment').split())[:60]}",
                     client=t3_client,
@@ -522,6 +551,7 @@ def build_app(config: Settings | LiveSettings) -> App:
                     on_approval_wait=approval_wait,
                     approval_timeout=cfg.approval_timeout,
                     owner_name=settings.t3_owner,
+                    customer=customer_mode,
                 )
             else:
                 result = backend.run_turn(
@@ -538,6 +568,39 @@ def build_app(config: Settings | LiveSettings) -> App:
 
             if result.session_id:
                 sessions.set(channel_id, thread_ts, result.session_id)
+
+            if customer_mode:
+                # Only the agent's marked block is for the customer; anything
+                # else (no block, a technical-looking block, a failed run) gets
+                # a neutral line that claims nothing, and the owners get the
+                # raw text. The customer never sees error text or a tool name.
+                source, final, why = "holding", customer.HOLDING_LINE, None
+                if result.private:
+                    # Dan steered a `#agent` message into this run: its reply is
+                    # for him. Leave the placeholder as a neutral note (deleting
+                    # it would look like the bot vanished) and tell no one else.
+                    final = "Dan is following up on this directly."
+                elif result.ok:
+                    outcome = customer.resolve_final(result.text)
+                    if outcome.kind == "block":
+                        source, final = "block", outcome.text
+                    else:
+                        why = outcome.why or "empty final message"
+                elif result.awaiting_approval:
+                    final = (f"This is waiting on a go-ahead from {settings.t3_owner}. "
+                             "I'll update you here as soon as it's through.")
+                else:
+                    logger.error("turn failed: %s", result.error)
+                    final = (f"Something went wrong on my end and I couldn't finish "
+                             f"this. I've let {settings.t3_owner} know.")
+                    why = f"the run did not complete ({result.error})"
+                if why:
+                    customer.alert_owners(client, settings, channel=channel_id,
+                                          thread_ts=thread_ts, reason=why, raw=result.text)
+                slack_ts = finish(final)
+                ledger.append(ledger_key, source, scrub(final)[0], slack_ts=slack_ts,
+                              t3_message_id=result.message_id if source == "block" else None)
+                return
 
             if result.ok:
                 final = result.text or "(no output)"

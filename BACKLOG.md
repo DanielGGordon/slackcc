@@ -3,6 +3,18 @@
 Roughly in priority order. Part 1 (autonomous back-and-forth in a configured
 channel) is the only thing built today.
 
+## Customer voice: deferred
+Built: per-channel `audience: "customer"` (marked block, leak gate, fallback,
+plain progress, told-so-far ledger, `#agent`). Not built yet:
+- LLM fallback translator: turn the raw final into a customer message when the
+  agent wrote no block -- only worth it if the block-miss rate (owner DMs) is high.
+- Agent-reported progress counts (e.g. "3 of 12 done") instead of the daemon's
+  tool-step count; needs the agent to publish them, not TodoWrite scraping.
+- WebSocket subscribe for the mirror and progress instead of polling.
+- The deploy pipeline posting its own "it's live" line, so the agent's block can
+  stay at "being published".
+- A staging-environment workflow to replace guest auto-ship straight to production.
+
 ## Prompt-injection protection (explicitly requested)
 Built: pps (the sandboxed LLM judge) screens every non-owner message before
 dispatch and fails closed, so content that reaches the agent is trusted and

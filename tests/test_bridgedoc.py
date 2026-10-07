@@ -183,3 +183,35 @@ def test_is_current_still_catches_older_text_with_a_different_cli_dir(tmp_path):
     path.write_text(body)
 
     assert bridgedoc.is_current(tmp_path) is False
+
+
+def test_packaged_doc_keys_autoship_on_role_and_plain_replies_on_audience():
+    rendered = bridgedoc.render()
+    flat = " ".join(rendered.split())
+
+    assert "no `role` means `owner`" in flat and "no `audience` means `technical`" in flat
+    guests = rendered.split("### Guests: ship it")[1].split("### Customer channels")[0]
+    assert "role=guest" in guests and "Auto-ship" in guests and "merge it" in guests
+    # plain-reply rules moved out of the guest section: no contradictory copy
+    assert "Plain, short" not in rendered
+    assert "non-technical" not in guests
+    customers = rendered.split("### Customer channels")[1].split("### Trust")[0]
+    assert "audience=customer" in customers
+    assert "`audience=technical`" in customers
+
+
+def test_packaged_doc_teaches_the_exact_customer_block_marker():
+    from slackcc import customer
+
+    rendered = bridgedoc.render()
+    # the heading the parser looks for must be the one the agent is told to write
+    assert f"\n{customer.MARKER}\n" in rendered
+    flat = " ".join(rendered.split())
+    assert "written LAST" in flat and "being published" in flat
+    assert "#agent" in rendered
+    assert "[What the customer has been told so far" in flat
+
+
+def test_packaged_doc_does_not_lean_on_the_operators_dotfiles():
+    rendered = bridgedoc.render()
+    assert "dotfiles" not in rendered and "~/.claude" not in rendered

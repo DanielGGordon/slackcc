@@ -11,6 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+AUDIENCES = ("technical", "customer")
+
+
 @dataclass(frozen=True)
 class ChannelConfig:
     """Routing + scoping for one Slack channel."""
@@ -41,6 +44,12 @@ class ChannelConfig:
     # and the bot should only speak up when actually @-mentioned or replying
     # in a thread it already joined -- see app.py's handle() for the gating.
     require_mention: bool = False
+    # Who reads this channel: "technical" (default) = the owner-style channel,
+    # replies stay as the agent wrote them. "customer" = non-coders: every turn
+    # runs in customer mode -- the agent ends with a marked plain-language block
+    # and only that block reaches Slack (customer.py). A property of the
+    # channel, not the sender: even a turn Dan triggers from Slack is customer-voiced.
+    audience: str = "technical"
 
     def validate(self) -> None:
         if not Path(self.cwd).is_dir():
@@ -49,8 +58,14 @@ class ChannelConfig:
             )
         if self.backend not in ("claude", "t3"):
             raise ValueError(f"channel {self.channel_id}: unknown backend {self.backend!r}")
+        if self.audience not in AUDIENCES:
+            raise ValueError(f"channel {self.channel_id}: unknown audience {self.audience!r}")
         if self.backend == "t3" and not self.t3_project_id:
             raise ValueError(f"channel {self.channel_id}: backend 't3' needs t3_project_id")
+
+
+# Non-owners (guests) start T3 threads on this unless senders.json says otherwise.
+DEFAULT_GUEST_T3_MODEL = {"instanceId": "claudeAgent", "model": "claude-sonnet-5-5"}
 
 
 @dataclass(frozen=True)
@@ -67,6 +82,11 @@ class SenderPolicy:
     runtime_mode: str = "approval-required"  # legacy; bridge forces full-access
     pps_mode: str = "enforce"  # "skip" | "log" | "enforce"
     policy_extra: str = ""  # appended to the generated pps policy text
+    # T3 modelSelection for threads this sender STARTS (non-owners only; owners
+    # always use the channel's t3_model). None = inherit guest_defaults, then
+    # DEFAULT_GUEST_T3_MODEL. T3 fixes the model at thread creation, so a later
+    # reply from someone else never changes it.
+    t3_model: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -101,6 +121,18 @@ class Settings:
         turn parks on an approval. Empty without a senders.json (no guests then)."""
         return [uid for uid, sp in self.senders.items() if sp.role == "owner"]
 
+    def t3_model_for(self, sp: SenderPolicy, cfg: ChannelConfig) -> dict:
+        """Model for a NEW T3 thread started by `sp`: owners get the channel's
+        t3_model; everyone else their own override, else guest_defaults', else
+        the built-in guest default (Sonnet 5.5)."""
+        if sp.role == "owner":
+            return cfg.t3_model
+        if sp.t3_model is not None:
+            return sp.t3_model
+        if self.guest_defaults is not None and self.guest_defaults.t3_model is not None:
+            return self.guest_defaults.t3_model
+        return dict(DEFAULT_GUEST_T3_MODEL)
+
     def t3_thread_url(self, thread_id: str) -> str | None:
         base = (self.t3_gui_url or "").rstrip("/")
         return f"{base}/primary/{thread_id}" if base else None
@@ -119,6 +151,7 @@ class Settings:
                 runtime_mode=self.guest_defaults.runtime_mode,
                 pps_mode=self.guest_defaults.pps_mode,
                 policy_extra=self.guest_defaults.policy_extra,
+                t3_model=self.guest_defaults.t3_model,
             )
         return SenderPolicy(user_id=user_id, name=user_id, role="owner",
                             runtime_mode="full-access", pps_mode="skip")
@@ -133,6 +166,17 @@ def _require_env(name: str) -> str:
 
 ROLES = ("owner", "guest")
 PPS_MODES = ("skip", "log", "enforce")
+
+
+def _model_field(spec: dict, where: str, default: dict | None) -> dict | None:
+    m = spec.get("t3_model", default)
+    if m is None:
+        return None
+    if not (isinstance(m, dict)
+            and all(_nonempty_str(m.get(k)) for k in ("instanceId", "model"))):
+        raise ValueError(f"{where}: t3_model must be an object with string "
+                         "instanceId and model")
+    return dict(m)
 
 
 def _nonempty_str(v: object) -> bool:
@@ -184,13 +228,8 @@ def parse_channels(raw: dict) -> dict[str, ChannelConfig]:
             raise ValueError(f"{where}: must be a JSON object")
         if "project" not in spec or "cwd" not in spec:
             raise ValueError(f"{where}: needs project and cwd")
-        t3_model = spec.get(
-            "t3_model", {"instanceId": "claudeAgent", "model": "claude-sonnet-5"}
-        )
-        if not (isinstance(t3_model, dict)
-                and all(_nonempty_str(t3_model.get(k)) for k in ("instanceId", "model"))):
-            raise ValueError(f"{where}: t3_model must be an object with string "
-                             "instanceId and model")
+        t3_model = _model_field(
+            spec, where, default={"instanceId": "claudeAgent", "model": "claude-sonnet-5"})
         allowed_tools = spec.get("allowed_tools", [])
         if not (isinstance(allowed_tools, list)
                 and all(isinstance(t, str) for t in allowed_tools)):
@@ -209,6 +248,7 @@ def parse_channels(raw: dict) -> dict[str, ChannelConfig]:
             t3_project_id=_str_field(spec, "t3_project_id", where, default=None, optional=True),
             t3_model=dict(t3_model),
             require_mention=bool(spec.get("require_mention", False)),
+            audience=_str_field(spec, "audience", where, default="technical"),
         )
         cfg.validate()
         out[channel_id] = cfg
@@ -240,6 +280,7 @@ def parse_senders(raw: dict | None) -> tuple[dict[str, SenderPolicy], SenderPoli
             pps_mode=_str_field(spec, "pps_mode", where,
                                 default="skip" if owner else "enforce"),
             policy_extra=_str_field(spec, "policy_extra", where, default="", empty_ok=True),
+            t3_model=_model_field(spec, where, default=None),
         )
         # Every enum is checked, guest_defaults included: pps enforcement is
         # `pps_mode == "enforce"`, so a typo would otherwise fail OPEN.
@@ -295,11 +336,13 @@ def effective(settings: Settings) -> dict:
                 "t3_project_id": c.t3_project_id, "t3_model": c.t3_model,
                 "permission_mode": c.permission_mode, "timeout": c.timeout,
                 "approval_timeout": c.approval_timeout,
-                "require_mention": c.require_mention}
+                "require_mention": c.require_mention, "audience": c.audience}
 
     def sp(p: SenderPolicy) -> dict:
         return {"name": p.name, "role": p.role, "runtime_mode": p.runtime_mode,
-                "pps_mode": p.pps_mode, "policy_extra": p.policy_extra}
+                "pps_mode": p.pps_mode, "policy_extra": p.policy_extra,
+                # owners ignore this (channel t3_model applies); null = inherit
+                "t3_model": p.t3_model}
 
     return {
         "channels": {k: ch(v) for k, v in settings.channels.items()},

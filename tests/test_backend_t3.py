@@ -734,6 +734,100 @@ def test_progress_tool_label_falls_back_to_input_and_clips_narration():
     assert tool == "`mcp__brain__search`"
 
 
+def test_customer_progress_has_no_tool_label_and_counts_steps(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    thread_id = "t3-thread-customer-progress"
+    mirror = make_mirror(tmp_path, thread_id)
+    client = FakeT3Client(projections=[
+        running(narration=["Adding the new price to the booking page."],
+                tools=["grep -n price src/app.py", "Read src/booking.tsx"]),
+        completed(),
+    ])
+    updates: list[str] = []
+
+    result = go(client, mirror, thread_id, on_progress=updates.append, customer=True)
+
+    assert result.ok is True
+    assert updates == [
+        ":hourglass_flowing_sand: Adding the new price to the booking page.\n"
+        "_Still working on it - less than a minute in, 2 steps so far._"
+    ]
+    assert "src/" not in updates[0] and "`" not in updates[0]
+
+
+def test_customer_progress_swaps_technical_narration_for_a_generic_line(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    thread_id = "t3-thread-customer-generic"
+    mirror = make_mirror(tmp_path, thread_id)
+    client = FakeT3Client(projections=[
+        running(narration=["Now editing src/components/Booking.tsx"], tools=["x"]),
+        completed(),
+    ])
+    updates: list[str] = []
+
+    go(client, mirror, thread_id, on_progress=updates.append, customer=True)
+
+    assert "Booking.tsx" not in updates[0]
+    assert "Working through it now." in updates[0]
+
+
+def test_customer_progress_counts_only_this_runs_tool_items(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    thread_id = "t3-thread-customer-steps"
+    mirror = make_mirror(tmp_path, thread_id)
+    items = [tool_item("i-other", "x", OLD_RUN_ID),
+             {"id": "i-reason", "type": "reasoning", "runId": RUN_ID, "title": "y"}]
+    client = FakeT3Client(projections=[running(narration=["Working."], tools=["a"], items=items),
+                                       completed()])
+    updates: list[str] = []
+
+    go(client, mirror, thread_id, on_progress=updates.append, customer=True)
+
+    assert "1 step so far" in updates[0]
+
+
+def test_customer_progress_pause_line_names_no_command(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    thread_id = "t3-thread-customer-pause"
+    mirror = make_mirror(tmp_path, thread_id)
+    client = FakeT3Client(projections=[
+        running(narration=["Working."], runtime_requests=[
+            {"id": "req-1", "kind": "command", "status": "pending"}],
+            items=[{"id": "ap", "type": "approval_request", "requestId": "req-1",
+                    "runId": RUN_ID, "requestKind": "command", "prompt": "rm -rf build/"}]),
+        completed(),
+    ])
+    updates: list[str] = []
+
+    go(client, mirror, thread_id, on_progress=updates.append, on_approval_wait=lambda r: None,
+       owner_name="Dan", customer=True)
+
+    assert "waiting for Dan's go-ahead" in updates[0]
+    assert "rm -rf" not in updates[0] and "T3" not in updates[0]
+
+
+def test_technical_progress_is_unchanged_by_the_customer_flag_default(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    thread_id = "t3-thread-technical-default"
+    mirror = make_mirror(tmp_path, thread_id)
+    client = FakeT3Client(projections=[running(narration=["exploring"], tools=["ls src"]),
+                                       completed()])
+    updates: list[str] = []
+
+    go(client, mirror, thread_id, on_progress=updates.append)
+
+    assert updates == ["exploring\n`ls src`"]
+
+
+def test_ok_result_carries_the_final_message_id(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    thread_id = "t3-thread-message-id"
+    mirror = make_mirror(tmp_path, thread_id)
+    client = FakeT3Client(projections=[completed(reply_id="assist-final")])
+
+    assert go(client, mirror, thread_id).message_id == "assist-final"
+
+
 def test_progress_callback_error_does_not_kill_the_turn(tmp_path, monkeypatch):
     fast_poll(monkeypatch)
     thread_id = "t3-thread-progress-raises"
@@ -916,3 +1010,47 @@ def test_approval_wait_callback_error_does_not_kill_the_turn(tmp_path, monkeypat
     result = go(client, mirror, thread_id, timeout=5, on_approval_wait=boom)
 
     assert result.ok is True
+
+
+# --- review fixes -------------------------------------------------------------
+
+
+def test_customer_progress_never_leaks_the_streaming_final_with_the_marker(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    thread_id = "t3-thread-customer-final-leak"
+    mirror = make_mirror(tmp_path, thread_id)
+    client = FakeT3Client(projections=[
+        running(narration=["Adding the price.",
+                           "Changed the handler.\n\n### Message for the customer\nAll set."]),
+        completed(),
+    ])
+    updates: list[str] = []
+
+    go(client, mirror, thread_id, on_progress=updates.append, customer=True)
+
+    assert "handler" not in updates[0] and "All set" not in updates[0]
+    assert "Working through it now." in updates[0]
+
+
+def test_run_followed_by_a_human_agent_message_is_flagged_private(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    thread_id = "t3-thread-private"
+    mirror = make_mirror(tmp_path, thread_id)
+
+    def steered(mid):
+        proj = projection(mid, "completed")
+        proj["messages"].append({"id": "gui-1", "role": "user", "runId": RUN_ID,
+                                 "text": "#agent also check logs", "streaming": False,
+                                 "createdBy": "user", "creationSource": "web",
+                                 "updatedAt": "2026-10-07T12:00:00Z"})
+        return proj
+
+    client = FakeT3Client(projections=[steered])
+    assert go(client, mirror, thread_id).private is True
+
+
+def test_ordinary_run_is_not_private(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    thread_id = "t3-thread-not-private"
+    mirror = make_mirror(tmp_path, thread_id)
+    assert go(FakeT3Client(projections=[completed()]), mirror, thread_id).private is False

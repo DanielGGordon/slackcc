@@ -19,6 +19,14 @@
       "permission_mode": "acceptEdits",
       "timeout": 600
     },
+    "C0CUSTOMERS": {
+      "_comment": "audience (default 'technical'): set 'customer' for a channel read by non-coders. Every turn there runs in customer mode -- the agent ends with a '### Message for the customer' block and only that block is posted to Slack; Dan's GUI messages are forwarded as '*Dan:* ...' unless they start with #agent; a missing/technical block posts a neutral holding line and DMs the owners. See README 'Customer channels'.",
+      "project": "customer-app",
+      "cwd": "/home/you/projects/customer-app",
+      "backend": "t3",
+      "t3_project_id": "00000000-0000-0000-0000-000000000000",
+      "audience": "customer"
+    },
     "C0ZZZZZZZZZ": {
       "_comment": "require_mention (default false): set true for a channel that's ALSO used for unrelated conversation. The bot then stays silent on plain messages unless it's actually @-mentioned (or the message is a reply in a thread it already joined) -- instead of replying to every message like the default 'works without me' loop.",
       "project": "shared-channel-project",

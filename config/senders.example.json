@@ -1,5 +1,5 @@
 {
-  "_comment": "Per-sender permissions. Known senders listed here; anyone else gets guest_defaults (approval-required T3 runtime mode + blocking pps screen, fail-closed). When pps declines a guest message the bot @-mentions every owner in the thread; an owner replying a bare Yes/No permits or keeps the denial. Delete this file to turn protection off entirely (everyone owner, pre-pps behavior). pps_mode: skip | log | enforce. Find a user's id: click their profile in Slack > three dots > Copy member ID.",
+  "_comment": "Per-sender permissions. Known senders listed here; anyone else gets guest_defaults (approval-required T3 runtime mode + blocking pps screen, fail-closed). When pps declines a guest message the bot @-mentions every owner in the thread; an owner replying a bare Yes/No permits or keeps the denial. Delete this file to turn protection off entirely (everyone owner, pre-pps behavior). pps_mode: skip | log | enforce. t3_model (optional, non-owners only): the T3 model for threads that sender STARTS; unset = guest_defaults, then the built-in Sonnet 5.5 (claude-sonnet-5-5). Owners always use the channel's t3_model. T3 fixes a thread's model at creation, so a reply from someone else never changes it. Find a user's id: click their profile in Slack > three dots > Copy member ID.",
   "senders": {
     "U0XXXXXXXXX": {
       "name": "YourName",
@@ -10,11 +10,13 @@
       "role": "guest",
       "runtime_mode": "approval-required",
       "pps_mode": "enforce",
+      "t3_model": {"instanceId": "claudeAgent", "model": "claude-sonnet-5-5"},
       "policy_extra": "May also ask about the staging environment."
     }
   },
   "guest_defaults": {
     "runtime_mode": "approval-required",
-    "pps_mode": "enforce"
+    "pps_mode": "enforce",
+    "t3_model": {"instanceId": "claudeAgent", "model": "claude-sonnet-5-5"}
   }
 }

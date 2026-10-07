@@ -45,6 +45,12 @@ class TurnResult:
     # the T3 GUI and the bridge stopped holding the Slack thread for it. The
     # turn is still running there; the mirror delivers its eventual reply.
     awaiting_approval: bool = False
+    # t3 backend only: id of the final assistant message `text` came from, so
+    # the customer ledger can point back at it.
+    message_id: str | None = None
+    # t3 backend only: a human `#agent` message was steered into this run, so
+    # its reply is for the owner alone and must not be posted to Slack.
+    private: bool = False
 
 
 def _build_options(
