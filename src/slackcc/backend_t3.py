@@ -48,6 +48,8 @@ _POLL_SECS = 2.5
 _PROGRESS_MIN_SECS = 5.0  # floor between on_progress emissions (Slack edit budget)
 _NARRATION_CLIP = 600
 _TOOL_CLIP = 200
+# Fragment of T3's ContextHandoffBudgetError message.
+_CONTEXT_FULL_MARKER = "Insufficient context allowance"
 
 # Turn items that are the agent doing something (what the GUI shows as a tool row).
 _TOOL_ITEM_TYPES = {"command_execution", "dynamic_tool", "file_change", "web_search",
@@ -185,7 +187,43 @@ def _upload_images(client: T3Client, images: list[dict]) -> list[dict]:
     return staged
 
 
-def run_turn(
+def _context_full(projection: dict, run_id: str) -> bool:
+    """Whether the run failed on T3's context-handoff budget: the session is too
+    full to re-inject history, so every further turn fails until it is
+    compacted. T3 files the failure as an `error` turn item."""
+    for item in projection.get("turnItems", []):
+        if item.get("runId") == run_id and item.get("type") == "error":
+            message = (item.get("failure") or {}).get("message") or ""
+            if _CONTEXT_FULL_MARKER in message:
+                return True
+    return False
+
+
+def run_turn(**kwargs) -> TurnResult:
+    """One Slack turn, with a safety net for a full session: if the run fails
+    because the context window has no room left, compact the session once and
+    retry the same prompt. A failed compaction or a second failure is returned
+    as-is -- never a loop."""
+    result = _run_once(**kwargs)
+    if not result.context_full:
+        return result
+    thread_id = kwargs["thread_id"]
+    log.warning("t3 context full on %s; compacting and retrying once", thread_id)
+    on_progress = kwargs.get("on_progress")
+    if on_progress is not None:
+        try:
+            on_progress(":broom: _the conversation is long -- tidying it up first_")
+        except Exception:  # noqa: BLE001 - progress must not kill the turn
+            log.warning("progress callback failed", exc_info=True)
+    compact = _run_once(**{**kwargs, "prompt": "/compact", "is_new": False, "images": None,
+                           "on_progress": None, "on_approval_wait": None})
+    if not compact.ok:
+        log.error("auto-compact failed on %s: %s", thread_id, compact.error)
+        return result
+    return _run_once(**{**kwargs, "is_new": False})
+
+
+def _run_once(
     *,
     prompt: str,
     thread_id: str,
@@ -355,6 +393,7 @@ def run_turn(
             session_id=thread_id,
             error=f"T3 run ended in state '{status}'",
             private=private,
+            context_full=status == "failed" and _context_full(projection, run_id),
         )
 
     _interrupt(client, thread_id, run_id)
