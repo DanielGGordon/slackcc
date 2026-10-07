@@ -183,3 +183,12 @@ def test_is_current_still_catches_older_text_with_a_different_cli_dir(tmp_path):
     path.write_text(body)
 
     assert bridgedoc.is_current(tmp_path) is False
+
+
+def test_packaged_doc_has_guest_autoship_and_plain_reply_rules():
+    rendered = bridgedoc.render()
+
+    assert "role=guest" in rendered
+    assert "Auto-ship" in rendered and "merge it" in rendered
+    assert "Plain, short replies" in rendered
+    assert "no `role` means `owner`" in " ".join(rendered.split())

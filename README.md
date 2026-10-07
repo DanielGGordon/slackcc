@@ -71,8 +71,8 @@ Slack channel ──(Socket Mode)──> slackcc daemon ──┬──> backend
   in `<<<EXTERNAL_UNTRUSTED_CONTENT>>>` markers plus the matching directive
   (`sanitize.py`).
 - **Bridge protocol lives outside the prompt:** each turn carries one routing
-  comment (`<!-- slack channel=… thread=… -->`) that the T3 GUI hides from the
-  reader, plus a human attribution line (`Berish Perlman from #sofer-ai: …`,
+  comment (`<!-- slack channel=… thread=… role=owner|guest -->`; a missing
+  `role` means owner) that the T3 GUI hides from the reader, plus a human attribution line (`Berish Perlman from #sofer-ai: …`,
   names resolved via `users.info`/`conversations.info` and cached). How to
   reply, upload files, and post extra messages ships with the package
   (`src/slackcc/data/slack-bridge.md`) and reaches the agent through its system

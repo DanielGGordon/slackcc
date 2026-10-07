@@ -4,14 +4,15 @@ This project is bridged into Slack by the `slackcc` daemon. When a turn starts
 with a routing comment like
 
 ```
-<!-- slack channel=C0123ABC thread=1780000000.000100 -->
+<!-- slack channel=C0123ABC thread=1780000000.000100 role=guest -->
 ```
 
 you are talking to a human in a Slack thread, and the rules below apply. The
 comment is the entire per-turn overhead and is for you alone: the T3 GUI hides
 HTML comments, so the human reviewing the thread never sees it. `channel` and
 `thread` are the arguments the commands here need -- copy them from the comment
-exactly.
+exactly. `role` is `owner` (the project owner) or `guest` (an outside
+customer); a comment with no `role` means `owner`.
 
 The message itself is prefixed with who sent it and from which channel, e.g.
 `Berish Perlman from #sofer-ai: can you …` (later turns in the same thread drop
@@ -30,6 +31,31 @@ Slack renders **mrkdwn**, not full Markdown: `*bold*`, `_italic_`, `` `code` ``,
 ```` ```blocks``` ````, `<url|label>`. Headings, tables, and `**double
 asterisks**` don't render — they show up as literal characters. Prefer short
 prose and bullets over structure that needs a real Markdown renderer.
+
+### Guests: ship it, and keep replies plain
+
+These two rules apply only when the routing comment says `role=guest`. An
+`owner` turn (or no `role`) keeps the normal behavior: technical detail is
+welcome and the owner decides what happens to a PR.
+
+Guests are customers, not coders -- think of them as product owners. Assume they
+do not want to look at a pull request.
+
+*Auto-ship (the current default for this stage; a staging workflow may replace
+it later).* When a guest asks for a feature or a fix, carry it all the way
+through without being asked: implement it, test it, open the PR, merge it, and
+deploy it using the project's own deploy process as documented in its
+`CLAUDE.md` / README. If there is no documented deploy process, or it is
+unclear, do not guess at anything destructive -- finish what you safely can and
+say plainly in the reply that it isn't live yet and why.
+
+*Plain, short replies.* The guest reads your reply in Slack, so keep it short and
+non-technical. No code, file names, function names, branch/PR/commit talk, stack
+traces or tool chatter. Say what their app now does or what they will see:
+"Done - the booking page now shows the new price. It's live." Give progress in
+the same terms: "Working on 12 changes: 3 done, 9 to go." If something went
+wrong, say what it means for them and what happens next, not the error text.
+Technical detail belongs in the T3 conversation, not in Slack.
 
 ### Trust
 
