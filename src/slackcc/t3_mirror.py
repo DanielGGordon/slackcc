@@ -9,6 +9,11 @@ Only a user-role message T3 marks as human-typed (`t3.typed_by_human`) is
 attributed to the owner; T3 also files agent text under role "user" (subagent
 reports, agent-to-agent sends), and those are skipped, never posted.
 
+Customer-audience channels (`audience: "customer"`, see customer.py) differ:
+Dan's GUI-typed messages are forwarded verbatim as "*Dan:* ..." unless they
+start with `#agent` (private: not forwarded, and the run they trigger posts
+nothing), and a run's final reply is reduced to its marked customer block.
+
 Design constraints:
 - Poll-only. T3 has no self-hosted webhook; WS subscribe is a later upgrade.
 - Messages are only posted once `streaming` is false AND older than a short
@@ -22,12 +27,14 @@ Design constraints:
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from datetime import datetime, timezone
 
 from slack_sdk import WebClient
 
+from . import customer
 from .outbound import scrub
 from .t3 import MirrorStore, T3Client, T3Error, final_reply, typed_by_human
 
@@ -51,13 +58,71 @@ def _age_secs(iso: str) -> float:
     return (datetime.now(timezone.utc) - ts).total_seconds()
 
 
-def _post(slack: WebClient, channel: str, thread_ts: str, text: str) -> None:
+# "#agent", then whitespace and/or a colon (or nothing): Dan talking to the
+# agent only. "#agentic" is not it.
+_PRIVATE = re.compile(r"\s*#agent(?![\w-])[\s:]*", re.IGNORECASE)
+
+
+def _post(slack: WebClient, channel: str, thread_ts: str, text: str) -> str | None:
+    """Post (chunked); returns the Slack ts of the first chunk."""
+    first = None
     for i in range(0, len(text), _SLACK_CHUNK):
-        slack.chat_postMessage(channel=channel, thread_ts=thread_ts,
-                               text=text[i:i + _SLACK_CHUNK])
+        resp = slack.chat_postMessage(channel=channel, thread_ts=thread_ts,
+                                      text=text[i:i + _SLACK_CHUNK])
+        first = first or (resp or {}).get("ts")
+    return first
 
 
-def _sweep(t3: T3Client, slack: WebClient, mirror: MirrorStore, owner: str) -> None:
+def _private_runs(messages: list[dict], runs: list[dict]) -> set[str]:
+    """Runs started by a human-typed `#agent` message: their replies are for
+    Dan alone. A run is found the way backend_t3 finds its own: by the
+    message's `runId`, or the run's `userMessageId`."""
+    private = {m["id"] for m in messages
+               if m.get("role") == "user" and m.get("id") and typed_by_human(m)
+               and _PRIVATE.match(m.get("text") or "")}
+    return ({m["runId"] for m in messages if m.get("id") in private and m.get("runId")}
+            | {r["id"] for r in runs if r.get("userMessageId") in private})
+
+
+def _customer_delivery(slack: WebClient, mirror: MirrorStore, thread_id: str, entry: dict,
+                       msg: dict, text: str, *, owner: str, settings, ledger,
+                       private_runs: set[str]) -> None:
+    """One eligible message of a customer-audience thread (already checked:
+    settled, aged, not yet posted, and user-role ones are human-typed)."""
+    mid, chan, ts = msg["id"], entry["channel"], entry["thread_ts"]
+    key = customer.thread_key(chan, ts)
+    mirror.mark_posted(thread_id, [mid])
+    if msg.get("role") == "user":
+        if _PRIVATE.match(text):
+            log.info("mirror: #agent message %s on %s is private; not forwarded", mid, thread_id)
+            return
+        text = scrub(text)[0]
+        sent = _post(slack, chan, ts, f"*{owner}:* {text}")
+        ledger.append(key, "dan_forward", text, slack_ts=sent, t3_message_id=mid)
+        return
+    if msg.get("runId") in private_runs:
+        log.info("mirror: reply %s on %s answers a #agent message; not posted", mid, thread_id)
+        return
+    outcome = customer.resolve_final(text)
+    if outcome.kind == "block":
+        block = scrub(outcome.text)[0]
+        sent = _post(slack, chan, ts, block)
+        ledger.append(key, "block", block, slack_ts=sent, t3_message_id=mid)
+        return
+    # No usable block. A reply that merely lacks one stays silent in Slack (the
+    # customer wasn't waiting on a Slack turn); a technical-looking block gets
+    # the same neutral line as a Slack turn. Either way the owners are told once.
+    if outcome.kind == "gated":
+        sent = _post(slack, chan, ts, customer.HOLDING_LINE)
+        ledger.append(key, "holding", customer.HOLDING_LINE, slack_ts=sent)
+    customer.alert_owners(slack, settings, channel=chan, thread_ts=ts,
+                          reason=outcome.why, raw=text)
+
+
+def _sweep(t3: T3Client, slack: WebClient, mirror: MirrorStore, owner: str, *,
+           live=None, ledger: customer.Ledger | None = None) -> None:
+    """`live` (LiveSettings) says which channels are customer-audience; without
+    it every thread keeps the technical behavior."""
     for thread_id, entry in mirror.threads().items():
         try:
             projection = t3.thread_projection(thread_id)
@@ -74,6 +139,11 @@ def _sweep(t3: T3Client, slack: WebClient, mirror: MirrorStore, owner: str) -> N
             log.info("mirror: thread %s deleted in T3; unregistering", thread_id)
             mirror.remove(thread_id)
             continue
+        settings = live.current if live is not None else None
+        cfg = settings.channel(entry["channel"]) if settings is not None else None
+        voice = cfg is not None and cfg.audience == "customer" and ledger is not None
+        tail = projection.get("messages", [])[-_TAIL_MESSAGES:]
+        private_runs = _private_runs(tail, projection.get("runs", [])) if voice else set()
         # Only a completed run's final assistant message belongs in Slack;
         # intermediate narration between tool calls is skipped, unledgered.
         finals = set()
@@ -82,7 +152,7 @@ def _sweep(t3: T3Client, slack: WebClient, mirror: MirrorStore, owner: str) -> N
                 reply = final_reply(projection, run.get("id"))
                 if reply is not None:
                     finals.add(reply["id"])
-        for msg in projection.get("messages", [])[-_TAIL_MESSAGES:]:
+        for msg in tail:
             role = msg.get("role")
             mid = msg.get("id", "")
             if msg.get("streaming") or not mid:
@@ -107,6 +177,15 @@ def _sweep(t3: T3Client, slack: WebClient, mirror: MirrorStore, owner: str) -> N
             text = (msg.get("text") or "").strip()
             if not text:
                 # Leave unledgered: the projection may still be filling in.
+                continue
+            if voice:
+                try:
+                    _customer_delivery(slack, mirror, thread_id, entry, msg, text,
+                                       owner=owner, settings=settings, ledger=ledger,
+                                       private_runs=private_runs)
+                except Exception:  # noqa: BLE001 - one bad post shouldn't kill the loop
+                    log.warning("mirror: customer delivery failed for %s", thread_id,
+                                exc_info=True)
                 continue
             mirror.mark_posted(thread_id, [mid])
             text = scrub(text)[0]
@@ -140,12 +219,13 @@ def _sweep(t3: T3Client, slack: WebClient, mirror: MirrorStore, owner: str) -> N
                     log.warning("mirror: settle notice failed for %s", thread_id, exc_info=True)
 
 
-def start(t3: T3Client, slack: WebClient, mirror: MirrorStore, owner: str) -> threading.Thread:
+def start(t3: T3Client, slack: WebClient, mirror: MirrorStore, owner: str, *,
+          live=None, ledger: customer.Ledger | None = None) -> threading.Thread:
     def loop() -> None:
         log.info("t3 mirror started (poll %.0fs)", _POLL_SECS)
         while True:
             try:
-                _sweep(t3, slack, mirror, owner)
+                _sweep(t3, slack, mirror, owner, live=live, ledger=ledger)
             except Exception:  # noqa: BLE001
                 log.exception("mirror sweep crashed; continuing")
             time.sleep(_POLL_SECS)

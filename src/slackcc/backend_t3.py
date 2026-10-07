@@ -37,6 +37,7 @@ import time
 import uuid
 from typing import Callable
 
+from . import customer as customer_voice
 from .backend import TurnResult
 from .t3 import (TERMINAL_RUN_STATUSES, MirrorStore, T3Client, T3Error, final_reply,
                  reply_streaming)
@@ -95,6 +96,19 @@ def _progress_summary(projection: dict, run_id: str) -> str:
     if tool:
         parts.append(f"`{_clip(tool, _TOOL_CLIP)}`")
     return "\n".join(parts)
+
+
+def _customer_progress(projection: dict, run_id: str, elapsed: float) -> str:
+    """The same live view for a customer channel: no tool label (it is file
+    names and commands), the newest narration only if it passes the leak gate,
+    and time + step count (the run's tool-type turn items) instead."""
+    narration = ""
+    for msg in projection.get("messages", []):
+        if msg.get("role") == "assistant" and msg.get("runId") == run_id:
+            narration = (msg.get("text") or "").strip() or narration
+    steps = sum(1 for item in projection.get("turnItems", [])
+                if item.get("runId") == run_id and item.get("type") in _TOOL_ITEM_TYPES)
+    return customer_voice.progress_text(narration, elapsed, steps, clip=_NARRATION_CLIP)
 
 
 def _pending_requests(projection: dict, run_id: str) -> list[dict]:
@@ -185,6 +199,7 @@ def run_turn(
     on_approval_wait: Callable[[list[dict]], None] | None = None,
     approval_timeout: int = 3600,
     owner_name: str = "the owner",
+    customer: bool = False,
 ) -> TurnResult:
     message_id = f"slack-user-{uuid.uuid4()}"
     # Ledger the inbound message BEFORE dispatch so the mirror never echoes a
@@ -238,7 +253,8 @@ def run_turn(
     # while the run is parked on a human (approval / question in the T3 GUI);
     # `approval_timeout` bounds that parked time so a never-answered request
     # can't hold this Slack handler forever.
-    deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    deadline = started + timeout
     approval_deadline: float | None = None
     last_tick = time.monotonic()
     last_progress = ""
@@ -294,13 +310,18 @@ def run_turn(
             # Mid-run: surface what the agent is doing right now. The polls
             # already carry it; emit only on change, at a bounded rate.
             if on_progress is not None:
-                summary = _progress_summary(projection, run_id)
-                if pending:
-                    summary = "\n".join(filter(None, [
-                        summary,
-                        f":raised_hand: _paused -- waiting for {owner_name} to approve "
-                        f"{describe_request(pending[-1])} in T3_",
-                    ]))
+                if customer:
+                    summary = _customer_progress(projection, run_id, now - started)
+                    if pending:
+                        summary += f"\n:raised_hand: _paused -- waiting for {owner_name}'s go-ahead_"
+                else:
+                    summary = _progress_summary(projection, run_id)
+                    if pending:
+                        summary = "\n".join(filter(None, [
+                            summary,
+                            f":raised_hand: _paused -- waiting for {owner_name} to approve "
+                            f"{describe_request(pending[-1])} in T3_",
+                        ]))
                 if (summary and summary != last_progress
                         and now - last_progress_at >= _PROGRESS_MIN_SECS):
                     last_progress, last_progress_at = summary, now
@@ -320,7 +341,8 @@ def run_turn(
             mirror.mark_posted(thread_id, [reply["id"]])
 
         if status == "completed":
-            return TurnResult(ok=True, text=text, session_id=thread_id)
+            return TurnResult(ok=True, text=text, session_id=thread_id,
+                              message_id=reply["id"] if reply is not None else None)
         return TurnResult(
             ok=False,
             text=text,

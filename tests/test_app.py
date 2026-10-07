@@ -1901,3 +1901,176 @@ def test_handle_t3_model_guest_sonnet55_owner_channel_model(make_env):
     guest_call, owner_call = env.backend_t3_calls
     assert guest_call["model"] == {"instanceId": "claudeAgent", "model": "claude-sonnet-5-5"}
     assert owner_call["model"] == env.settings.channels["Ct3"].t3_model
+
+
+# --------------------------------------------------------------------------- #
+# handle(): customer-audience channels (customer.py)
+# --------------------------------------------------------------------------- #
+
+GOOD_FINAL = ("Changed the booking handler and its tests.\n\n"
+              "### Message for the customer\nYour booking page now shows the new price.")
+
+
+def customer_env(make_env, backend="t3"):
+    env = make_env()
+    base = env.settings.channels["Ct3"]
+    env.settings.channels["Ccust"] = ChannelConfig(
+        channel_id="Ccust", project="acme", cwd=base.cwd, backend=backend,
+        t3_project_id="proj-c" if backend == "t3" else None, audience="customer")
+    env.ledger_dir = env.sessions_path.parent / "customer_ledger"
+    return env
+
+
+def ledger_entries(env, ts):
+    path = env.ledger_dir / f"slack-Ccust-{ts.replace('.', '-')}.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def test_customer_turn_header_carries_audience_and_customer_flag(make_env):
+    env = customer_env(make_env)
+    env.backend_t3_result["value"] = TurnResult(ok=True, text=GOOD_FINAL, session_id="s")
+    call_handle(env, make_event(channel="Ccust", user="Uguest", ts="50.1"))
+    call = env.backend_t3_calls[0]
+    assert "role=guest audience=customer" in call["prompt"]
+    assert call["customer"] is True
+
+
+def test_technical_channel_turn_is_not_customer_mode(make_env):
+    env = make_env()
+    call_handle(env, make_event(channel="Ct3", user="Uowner", ts="50.2"))
+    call = env.backend_t3_calls[0]
+    assert "audience=technical" in call["prompt"]
+    assert call["customer"] is False
+    assert env.client.chat_update_calls[-1]["text"] == "t3 reply"
+
+
+def test_customer_turn_posts_only_the_block_and_ledgers_it(make_env):
+    env = customer_env(make_env)
+    env.backend_t3_result["value"] = TurnResult(
+        ok=True, text=GOOD_FINAL, session_id="s", message_id="assist-9")
+    call_handle(env, make_event(channel="Ccust", user="Uowner", ts="50.3"))
+
+    assert env.client.chat_update_calls[-1]["text"] == "Your booking page now shows the new price."
+    assert env.client.chat_postMessage_calls == []   # no owner DM
+    [entry] = ledger_entries(env, "50.3")
+    assert entry["source"] == "block" and entry["text"].startswith("Your booking page")
+    assert entry["slack_ts"] == "placeholder-1" and entry["t3_message_id"] == "assist-9"
+
+
+@pytest.mark.parametrize("final,why", [
+    ("Fixed it in src/app.py, all good.", "has no `### Message for the customer` block"),
+    ("tech\n### Message for the customer\nMerged PR #12 - it's live.", "looks technical"),
+    ("   ", "no `### Message for the customer` block"),
+])
+def test_customer_turn_without_a_usable_block_posts_holding_line_and_dms_owners(
+        make_env, final, why):
+    env = customer_env(make_env)
+    env.backend_t3_result["value"] = TurnResult(ok=True, text=final, session_id="s")
+    call_handle(env, make_event(channel="Ccust", user="Uguest", ts="50.4"))
+
+    assert env.client.chat_update_calls[-1]["text"] == (
+        "I've finished working on this and I'm putting together an update for you.")
+    [dm] = env.client.chat_postMessage_calls
+    assert dm["channel"] == "Uowner" and why in dm["text"]
+    assert "50.4" in dm["text"] and "slack-Ccust-50-4" in dm["text"]
+    if final.strip():
+        assert final.splitlines()[0] in dm["text"]   # the raw final text rides along
+    [entry] = ledger_entries(env, "50.4")
+    assert entry["source"] == "holding"
+
+
+def test_customer_turn_failure_hides_the_error_from_the_customer(make_env):
+    env = customer_env(make_env)
+    env.backend_t3_result["value"] = TurnResult(
+        ok=False, text="partial src/x.py", error="T3 run ended in state 'failed'")
+    call_handle(env, make_event(channel="Ccust", user="Uguest", ts="50.5"))
+
+    shown = env.client.chat_update_calls[-1]["text"]
+    assert "failed" not in shown and "T3" not in shown and "Dan" in shown
+    [dm] = env.client.chat_postMessage_calls
+    assert "T3 run ended in state 'failed'" in dm["text"]
+
+
+def test_customer_turn_parked_on_approval_is_phrased_for_the_customer(make_env):
+    env = customer_env(make_env)
+    env.backend_t3_result["value"] = TurnResult(
+        ok=False, text="", error="still waiting", awaiting_approval=True)
+    call_handle(env, make_event(channel="Ccust", user="Uguest", ts="50.6"))
+
+    shown = env.client.chat_update_calls[-1]["text"]
+    assert "go-ahead from Dan" in shown and "T3" not in shown
+    assert env.client.chat_postMessage_calls == []   # approval_wait already paged
+
+
+def test_customer_progress_edit_has_no_timer_header_or_tool_line(make_env, monkeypatch):
+    env = customer_env(make_env)
+
+    def run_turn(**kwargs):
+        kwargs["on_progress"](":hourglass_flowing_sand: Working through it now.\n"
+                              "_Still working on it - about 4 minutes in, 9 steps so far._")
+        return TurnResult(ok=True, text=GOOD_FINAL, session_id="s")
+
+    monkeypatch.setattr(app_mod.backend_t3, "run_turn", run_turn)
+    call_handle(env, make_event(channel="Ccust", user="Uguest", ts="50.7"))
+
+    progress = env.client.chat_update_calls[0]["text"]
+    assert progress.startswith(":hourglass_flowing_sand: Working through it now.")
+    assert "working…" not in progress and "9 steps so far" in progress
+
+
+def test_technical_progress_edit_keeps_the_timer_header(make_env, monkeypatch):
+    env = make_env()
+
+    def run_turn(**kwargs):
+        kwargs["on_progress"]("exploring\n`ls src`")
+        return TurnResult(ok=True, text="x", session_id="s")
+
+    monkeypatch.setattr(app_mod.backend_t3, "run_turn", run_turn)
+    call_handle(env, make_event(channel="Ct3", user="Uowner", ts="50.8"))
+    assert "_working… 0m 00s_\nexploring\n`ls src`" in env.client.chat_update_calls[0]["text"]
+
+
+def test_next_customer_turn_is_prefixed_with_what_the_customer_was_told(make_env):
+    env = customer_env(make_env)
+    env.backend_t3_result["value"] = TurnResult(ok=True, text=GOOD_FINAL, session_id="s")
+    call_handle(env, make_event(channel="Ccust", user="Uguest", ts="51.0", text="first"))
+    assert "[What the customer has been told" not in env.backend_t3_calls[0]["prompt"]
+
+    call_handle(env, make_event(channel="Ccust", user="Uguest", ts="51.1", thread_ts="51.0",
+                                text="and the colours?"))
+    # same Slack thread -> same ledger: the second turn sees the first block
+    prompt = env.backend_t3_calls[1]["prompt"]
+    assert ("[What the customer has been told so far in Slack (oldest first):\n"
+            "- you: Your booking page now shows the new price.]") in prompt
+    assert prompt.index("[What the customer") < prompt.index("and the colours?")
+
+
+def test_ledger_note_is_capped_at_the_last_four_entries(make_env):
+    env = customer_env(make_env)
+    led = app_mod.customer.Ledger(env.ledger_dir)
+    for i in range(7):
+        led.append("slack-Ccust-52-0", "dan_forward", f"line {i}")
+    call_handle(env, make_event(channel="Ccust", user="Uguest", ts="52.0"))
+    prompt = env.backend_t3_calls[0]["prompt"]
+    assert "line 3" in prompt and "line 6" in prompt and "line 2" not in prompt
+
+
+def test_technical_channel_gets_no_ledger_note_and_no_ledger_file(make_env):
+    env = make_env()
+    call_handle(env, make_event(channel="Ct3", user="Uowner", ts="53.0"))
+    assert "[What the customer" not in env.backend_t3_calls[0]["prompt"]
+    assert not (env.sessions_path.parent / "customer_ledger").exists()
+
+
+def test_customer_mode_on_the_claude_backend_also_extracts_the_block(make_env):
+    env = customer_env(make_env, backend="claude")
+    env.backend_result["value"] = TurnResult(ok=True, text=GOOD_FINAL, session_id="sc")
+    call_handle(env, make_event(channel="Ccust", user="Uowner", ts="54.0"))
+    assert env.client.chat_update_calls[-1]["text"] == "Your booking page now shows the new price."
+
+
+def test_mirror_is_started_with_live_settings_and_the_ledger(make_env):
+    env = make_env()
+    [(args, kwargs)] = env.mirror_start_calls
+    assert kwargs["live"] is env.app.slackcc_live
+    assert isinstance(kwargs["ledger"], app_mod.customer.Ledger)
