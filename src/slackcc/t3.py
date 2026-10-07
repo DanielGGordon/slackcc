@@ -178,6 +178,28 @@ def final_reply(projection: dict, run_id: str) -> dict | None:
     return reply
 
 
+# Creation sources that mean a person at a T3 client typed the message.
+_HUMAN_SOURCES = {"web", "mobile"}
+# Provenance markers T3 stamps on user-role messages it injects on someone
+# else's behalf: background-task/subagent completion notices, agent-to-agent
+# sends, scheduled-task prompts (which inherit their creator's createdBy), and
+# delegated-task completions.
+_INJECTED_MARKERS = ("notification", "senderThreadId", "scheduledTaskId", "delegatedCompletion")
+
+
+def typed_by_human(msg: dict) -> bool:
+    """Whether a user-role message was typed by a person in a T3 client.
+
+    Allowlist, not blocklist: T3 also files subagent reports, agent sends and
+    scheduled prompts under role "user" (`createdBy: "agent"`, or a
+    provenance marker), and v1-imported history as `creationSource:
+    "server"`. Anything without positive evidence of a human author --
+    including a message missing the fields altogether -- is not one."""
+    return (msg.get("createdBy") == "user"
+            and msg.get("creationSource") in _HUMAN_SOURCES
+            and not any(msg.get(key) for key in _INJECTED_MARKERS))
+
+
 def reply_streaming(projection: dict, run_id: str) -> bool:
     """Whether any of the run's assistant messages is still streaming."""
     return any(msg.get("role") == "assistant" and msg.get("runId") == run_id
