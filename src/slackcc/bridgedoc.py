@@ -6,7 +6,7 @@ data here and reaches the agent one of two ways, depending on backend:
 
 - `claude` backend: rendered into `--append-system-prompt`. Free, invisible in
   the channel, present on every turn. Nothing to install.
-- `t3` backend: `thread.turn.start` has no system-prompt field, and T3 spawns
+- `t3` backend: `message.dispatch` has no system-prompt field, and T3 spawns
   its sessions with setting sources `user,project,local` -- so the project's own
   `CLAUDE.md` is the free channel. `slackcc init-project` writes this document
   into a marker-delimited section there. Until that's done, `app.py` falls back

@@ -5,28 +5,29 @@ Same `TurnResult` contract as `backend.py`. `session_id` carries the T3 thread
 id (stored in the same SessionStore), so each Slack thread is one T3 thread —
 live-visible and steerable in the T3 GUI. T3's ClaudeAdapter loads the target
 project's CLAUDE.md via settingSources, so the channel persona lives there,
-not in a system-prompt append (thread.turn.start has no such field).
+not in a system-prompt append (message.dispatch has no such field).
 
-Completion detection: poll the thread snapshot until `latestTurn` (requested at
-or after our dispatch) reaches a terminal state, then read the message named by
-`latestTurn.assistantMessageId`. On timeout we dispatch `thread.turn.interrupt`
-so the turn doesn't keep running headless.
+Completion detection: poll the thread projection for the run our message landed
+in -- the message's own `runId`, so a message T3 steers into an already-active
+run (one the owner started in the GUI) is followed there too -- until that run
+reaches a terminal status, then read the run's final assistant message. On
+timeout we dispatch `run.interrupt` so the run doesn't keep going headless.
 
-While the turn is still running, the same polls feed `on_progress` with a
-summary of the in-flight work (newest narration segment + newest tool call),
-which the caller can surface (e.g. by editing the Slack placeholder).
+While the run is still going, the same polls feed `on_progress` with a summary
+of the in-flight work (newest narration segment + newest tool call), which the
+caller can surface (e.g. by editing the Slack placeholder).
 
-A turn can still block on a human: T3 parks it on an `approval.requested` /
-`user-input.requested` activity until someone acts in the GUI. The bridge runs
-every turn full-access (trust is decided at the Slack/pps layer), so tool-call
-approvals don't fire here; what remains is the agent explicitly asking a
-question (`user-input.requested`, e.g. AskUserQuestion). That wait is not the
+A run can still block on a human: T3 parks it on a pending runtime request
+(`approval_request` / `user_input_request`) until someone acts in the GUI. The
+bridge runs every turn full-access (trust is decided at the Slack/pps layer),
+so tool-call approvals don't fire here; what remains is the agent explicitly
+asking a question (`user_input`, e.g. AskUserQuestion). That wait is not the
 agent's time, so the turn `timeout` clock pauses while a request is pending,
 `on_approval_wait` fires once per new request (so the caller can page the
 owner), and a separate `approval_timeout` bounds how long the bridge holds the
-Slack thread. When that expires the turn is left running -- NOT interrupted --
-so the owner can still answer later; the mirror delivers the eventual reply
-into Slack (`TurnResult.awaiting_approval`).
+Slack thread. When that expires the run is left going -- NOT interrupted -- so
+the owner can still answer later; the mirror delivers the eventual reply into
+Slack (`TurnResult.awaiting_approval`).
 """
 
 from __future__ import annotations
@@ -34,42 +35,60 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
 from typing import Callable
 
 from .backend import TurnResult
-from .t3 import MirrorStore, T3Client, T3Error
+from .t3 import (TERMINAL_RUN_STATUSES, MirrorStore, T3Client, T3Error, final_reply,
+                 reply_streaming)
 
 log = logging.getLogger(__name__)
 
 _POLL_SECS = 2.5
-_TERMINAL = {"completed", "interrupted", "error"}
 _PROGRESS_MIN_SECS = 5.0  # floor between on_progress emissions (Slack edit budget)
 _NARRATION_CLIP = 600
 _TOOL_CLIP = 200
+
+# Turn items that are the agent doing something (what the GUI shows as a tool row).
+_TOOL_ITEM_TYPES = {"command_execution", "dynamic_tool", "file_change", "web_search",
+                    "file_search"}
 
 
 def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-def _progress_summary(thread: dict, turn_id: str | None) -> str:
+def _find_run(projection: dict, message_id: str) -> dict | None:
+    """The run carrying our message: the one the message is attributed to
+    (also covers a message steered into an already-active run), else the run
+    it started (`userMessageId`, set while the run is still queued)."""
+    run_id = next((m.get("runId") for m in projection.get("messages", [])
+                   if m.get("id") == message_id), None)
+    for run in projection.get("runs", []):
+        if (run_id and run.get("id") == run_id) or run.get("userMessageId") == message_id:
+            return run
+    return None
+
+
+def _tool_label(item: dict) -> str:
+    label = item.get("title") or item.get("fileName") or item.get("input") or ""
+    return label.strip() if isinstance(label, str) else ""
+
+
+def _progress_summary(projection: dict, run_id: str) -> str:
     """What the T3 GUI shows live, flattened for a Slack placeholder edit:
-    this turn's newest narration segment plus its newest tool call."""
-    if not turn_id:
-        return ""
+    this run's newest narration segment plus its newest tool call."""
     narration = ""
-    for msg in thread.get("messages", []):
-        if msg.get("role") == "assistant" and msg.get("turnId") == turn_id:
+    for msg in projection.get("messages", []):
+        if msg.get("role") == "assistant" and msg.get("runId") == run_id:
             text = (msg.get("text") or "").strip()
             if text:
                 narration = text
     tool = ""
-    for act in thread.get("activities", []):
-        if act.get("tone") == "tool" and act.get("turnId") == turn_id:
-            summary = (act.get("summary") or "").strip()
-            if summary:
-                tool = summary
+    for item in projection.get("turnItems", []):
+        if item.get("runId") == run_id and item.get("type") in _TOOL_ITEM_TYPES:
+            label = _tool_label(item)
+            if label:
+                tool = label
     parts = []
     if narration:
         parts.append(_clip(narration, _NARRATION_CLIP))
@@ -78,64 +97,75 @@ def _progress_summary(thread: dict, turn_id: str | None) -> str:
     return "\n".join(parts)
 
 
-_BLOCKING_KINDS = {
-    # activity kind -> the kind that clears it
-    "approval.requested": "approval.resolved",
-    "user-input.requested": "user-input.resolved",
-}
-
-
-def _pending_requests(thread: dict, turn_id: str | None) -> list[dict]:
-    """Human-gated requests this turn is parked on: every approval / user-input
-    request activity whose requestId has no matching resolution yet. Ordered
-    oldest first. Each entry is the request activity's payload plus `kind`."""
-    if not turn_id:
-        return []
-    opened: dict[str, dict] = {}
-    for act in thread.get("activities", []):
-        if act.get("turnId") != turn_id:
+def _pending_requests(projection: dict, run_id: str) -> list[dict]:
+    """Human-gated requests this run is parked on: every pending runtime
+    request, joined with its turn item for the human-readable detail. Ordered
+    oldest first. Each entry: requestId, kind (the runtime request kind, e.g.
+    "user_input" or "command"), and requestKind / prompt / questions from the
+    item when present."""
+    items = {item.get("requestId"): item for item in projection.get("turnItems", [])
+             if item.get("type") in ("approval_request", "user_input_request")}
+    pending = []
+    for req in projection.get("runtimeRequests", []):
+        if req.get("status") != "pending":
             continue
-        kind = act.get("kind") or ""
-        payload = act.get("payload") or {}
-        request_id = payload.get("requestId") or act.get("id") or ""
-        if kind in _BLOCKING_KINDS:
-            opened[request_id] = {"kind": kind, "requestId": request_id, **payload}
-        elif kind in _BLOCKING_KINDS.values():
-            opened.pop(request_id, None)
-    return list(opened.values())
+        item = items.get(req.get("id")) or {}
+        if item.get("runId") not in (None, run_id):
+            continue
+        pending.append({
+            "requestId": req.get("id") or "",
+            "kind": req.get("kind") or "",
+            "requestKind": item.get("requestKind") or req.get("kind") or "",
+            "prompt": item.get("prompt") or item.get("title") or "",
+            "questions": item.get("questions") or [],
+        })
+    return pending
 
 
 def describe_request(req: dict) -> str:
     """One-line human label for a pending request (Slack-safe, clipped)."""
-    if req.get("kind") == "user-input.requested":
+    if req.get("kind") == "user_input":
         questions = req.get("questions") or []
         first = ""
         if questions and isinstance(questions[0], dict):
-            first = str(questions[0].get("question") or questions[0].get("prompt") or "")
+            first = str(questions[0].get("question") or questions[0].get("header") or "")
         return "a question for you" + (f": {_clip(first, _TOOL_CLIP)}" if first else "")
     label = {
         "command": "run a command",
         "file-change": "change a file",
         "file-read": "read a file",
     }.get(req.get("requestKind") or "", "a tool call")
-    detail = (req.get("detail") or "").strip()
+    detail = (req.get("prompt") or "").strip()
     return label + (f": `{_clip(detail, _TOOL_CLIP)}`" if detail else "")
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _interrupt(client: T3Client, thread_id: str) -> None:
+def _interrupt(client: T3Client, thread_id: str, run_id: str | None) -> None:
+    if not run_id:
+        return
     try:
         client.dispatch({
-            "type": "thread.turn.interrupt",
+            "type": "run.interrupt",
             "commandId": f"slack-int-{uuid.uuid4()}",
             "threadId": thread_id,
-            "createdAt": _now_iso(),
+            "runId": run_id,
         })
     except T3Error:
-        log.warning("could not interrupt T3 turn on thread %s", thread_id, exc_info=True)
+        log.warning("could not interrupt T3 run %s on thread %s", run_id, thread_id,
+                    exc_info=True)
+
+
+def _upload_images(client: T3Client, images: list[dict]) -> list[dict]:
+    """Stage each image with T3; a failed upload drops just that image (it
+    still reaches the agent via the local-path note in the prompt text)."""
+    staged = []
+    for image in images:
+        try:
+            staged.append(client.upload_image(
+                name=image["name"], mime_type=image["mimeType"], data=image["data"]))
+        except T3Error:
+            log.warning("T3 image upload failed for %s; sending without it",
+                        image.get("name"), exc_info=True)
+    return staged
 
 
 def run_turn(
@@ -148,7 +178,7 @@ def run_turn(
     title: str,
     client: T3Client,
     mirror: MirrorStore,
-    attachments: list[dict] | None = None,
+    images: list[dict] | None = None,
     timeout: int = 300,
     runtime_mode: str = "full-access",
     on_progress: Callable[[str], None] | None = None,
@@ -156,37 +186,19 @@ def run_turn(
     approval_timeout: int = 3600,
     owner_name: str = "the owner",
 ) -> TurnResult:
-    dispatched_at = _now_iso()
     message_id = f"slack-user-{uuid.uuid4()}"
     # Ledger the inbound message BEFORE dispatch so the mirror never echoes a
     # Slack-originated message back into Slack.
     mirror.mark_posted(thread_id, [message_id])
 
-    command: dict = {
-        "type": "thread.turn.start",
-        "commandId": f"slack-cmd-{uuid.uuid4()}",
-        "threadId": thread_id,
-        "message": {
-            "messageId": message_id,
-            "role": "user",
-            "text": prompt,
-            "attachments": attachments or [],
-        },
-        # The bridge always passes full-access: trust is decided at the
-        # Slack/pps layer, so T3 never re-gates tool calls (see app.py).
-        "runtimeMode": runtime_mode,
-        "interactionMode": "default",
-        "createdAt": dispatched_at,
-    }
-
     log.info("t3 turn: thread=%s new=%s project=%s", thread_id, is_new, project_id)
     if is_new:
-        # `bootstrap.createThread` is only expanded on the WS dispatch
-        # path (ws.ts); over plain HTTP the thread must exist first.
         try:
             client.dispatch({
                 "type": "thread.create",
                 "commandId": f"slack-mk-{uuid.uuid4()}",
+                "createdBy": "user",
+                "creationSource": "web",
                 "threadId": thread_id,
                 "projectId": project_id,
                 "title": title,
@@ -195,21 +207,35 @@ def run_turn(
                 "interactionMode": "default",
                 "branch": None,
                 "worktreePath": None,
-                "createdAt": dispatched_at,
             })
         except T3Error:
             # Deterministic ids make creates retryable: if the thread already
-            # exists (e.g. a crash between create and turn.start, or a stale
-            # sessions.json), proceed — turn.start surfaces any real problem.
+            # exists (e.g. a crash between create and dispatch, or a stale
+            # sessions.json), proceed — the message dispatch surfaces any real
+            # problem.
             log.warning("thread.create failed for %s; assuming it exists", thread_id,
                         exc_info=True)
+
     try:
-        client.dispatch(command)
+        client.dispatch({
+            "type": "message.dispatch",
+            "commandId": f"slack-cmd-{uuid.uuid4()}",
+            "createdBy": "user",
+            "creationSource": "web",
+            "threadId": thread_id,
+            "messageId": message_id,
+            "text": prompt,
+            "attachments": _upload_images(client, images or []),
+            # Same as the GUI composer: T3 starts a run when the thread is
+            # idle and resolves the delivery itself when one is active.
+            "deliveryIntent": "auto",
+            "dispatchMode": {"type": "start_immediately"},
+        })
     except T3Error as exc:
         return TurnResult(ok=False, text="", error=str(exc))
 
     # Two clocks: `timeout` bounds the agent's own working time and pauses
-    # while the turn is parked on a human (approval / question in the T3 GUI);
+    # while the run is parked on a human (approval / question in the T3 GUI);
     # `approval_timeout` bounds that parked time so a never-answered request
     # can't hold this Slack handler forever.
     deadline = time.monotonic() + timeout
@@ -218,21 +244,23 @@ def run_turn(
     last_progress = ""
     last_progress_at = 0.0
     seen_requests: set[str] = set()
+    run_id: str | None = None
     while time.monotonic() < deadline:
         time.sleep(_POLL_SECS)
         now = time.monotonic()
         elapsed, last_tick = now - last_tick, now
         try:
-            thread = client.thread_snapshot(thread_id).get("thread", {})
+            projection = client.thread_projection(thread_id)
         except T3Error:
-            log.warning("t3 snapshot poll failed for %s", thread_id, exc_info=True)
+            log.warning("t3 projection poll failed for %s", thread_id, exc_info=True)
             continue
-        turn = thread.get("latestTurn")
-        # Ignore a terminal turn left over from before this dispatch (resume case).
-        if not turn or turn.get("requestedAt", "") < dispatched_at:
-            continue
-        if turn.get("state") not in _TERMINAL:
-            pending = _pending_requests(thread, turn.get("turnId"))
+        run = _find_run(projection, message_id)
+        if run is None:
+            continue  # not picked up yet
+        run_id = run.get("id")
+        status = run.get("status")
+        if status not in TERMINAL_RUN_STATUSES:
+            pending = _pending_requests(projection, run_id)
             if pending:
                 # Parked on a human: this poll's wall time is theirs, not the
                 # agent's -- push the turn deadline out by it.
@@ -242,7 +270,7 @@ def run_turn(
                 fresh = [r for r in pending if r["requestId"] not in seen_requests]
                 if fresh:
                     seen_requests.update(r["requestId"] for r in fresh)
-                    log.info("t3 turn parked on %d pending request(s): thread=%s",
+                    log.info("t3 run parked on %d pending request(s): thread=%s",
                              len(pending), thread_id)
                     if on_approval_wait is not None:
                         try:
@@ -252,7 +280,7 @@ def run_turn(
                 if now >= approval_deadline:
                     # Hand the wait off: leave the request open in T3 so the
                     # owner can still act; the mirror posts the eventual reply.
-                    log.info("t3 turn still parked after %ss; releasing Slack handler: "
+                    log.info("t3 run still parked after %ss; releasing Slack handler: "
                              "thread=%s", approval_timeout, thread_id)
                     return TurnResult(
                         ok=False,
@@ -263,10 +291,10 @@ def run_turn(
                     )
             else:
                 approval_deadline = None
-            # Mid-turn: surface what the agent is doing right now. The polls
+            # Mid-run: surface what the agent is doing right now. The polls
             # already carry it; emit only on change, at a bounded rate.
             if on_progress is not None:
-                summary = _progress_summary(thread, turn.get("turnId"))
+                summary = _progress_summary(projection, run_id)
                 if pending:
                     summary = "\n".join(filter(None, [
                         summary,
@@ -282,26 +310,25 @@ def run_turn(
                         log.warning("progress callback failed", exc_info=True)
             continue
 
-        assistant_id = turn.get("assistantMessageId")
+        if reply_streaming(projection, run_id):
+            continue  # terminal, but the last segment hasn't landed yet
+        reply = final_reply(projection, run_id)
         text = ""
-        if assistant_id:
-            for msg in thread.get("messages", []):
-                if msg.get("id") == assistant_id and not msg.get("streaming"):
-                    text = (msg.get("text") or "").strip()
-                    break
+        if reply is not None:
+            text = reply["text"].strip()
             # Keep the mirror from double-posting the reply we're about to post.
-            mirror.mark_posted(thread_id, [assistant_id])
+            mirror.mark_posted(thread_id, [reply["id"]])
 
-        if turn["state"] == "completed":
+        if status == "completed":
             return TurnResult(ok=True, text=text, session_id=thread_id)
         return TurnResult(
             ok=False,
             text=text,
             session_id=thread_id,
-            error=f"T3 turn ended in state '{turn['state']}'",
+            error=f"T3 run ended in state '{status}'",
         )
 
-    _interrupt(client, thread_id)
+    _interrupt(client, thread_id, run_id)
     return TurnResult(
         ok=False,
         text="",

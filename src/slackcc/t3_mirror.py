@@ -11,6 +11,9 @@ Design constraints:
 - Messages are only posted once `streaming` is false AND older than a short
   grace period, closing the race where the mirror sees a completed reply a
   beat before `backend_t3.run_turn` ledgers it.
+- A thread deleted in the T3 GUI is a soft delete (`thread.deletedAt`); a
+  thread that never existed answers 404 `thread_not_found`. Either way the
+  mirror forgets it.
 """
 
 from __future__ import annotations
@@ -23,13 +26,18 @@ from datetime import datetime, timezone
 from slack_sdk import WebClient
 
 from .outbound import scrub
-from .t3 import MirrorStore, T3Client, T3Error
+from .t3 import MirrorStore, T3Client, T3Error, final_reply
 
 log = logging.getLogger(__name__)
 
 _POLL_SECS = 5.0
 _GRACE_SECS = 10.0
 _SLACK_CHUNK = 3800  # Slack rejects messages over ~4k chars
+_SETTLE_NOTICE_MAX_AGE_SECS = 3600.0
+# Only a thread's newest messages are considered. Older ones were handled on
+# earlier sweeps, and their ids may have aged out of the ledger (_POSTED_CAP
+# in t3.py) -- rescanning them would repost long-delivered history.
+_TAIL_MESSAGES = 200
 
 
 def _age_secs(iso: str) -> float:
@@ -49,28 +57,34 @@ def _post(slack: WebClient, channel: str, thread_ts: str, text: str) -> None:
 def _sweep(t3: T3Client, slack: WebClient, mirror: MirrorStore, owner: str) -> None:
     for thread_id, entry in mirror.threads().items():
         try:
-            thread = t3.thread_snapshot(thread_id).get("thread", {})
+            projection = t3.thread_projection(thread_id)
         except T3Error as exc:
             if "thread_not_found" in str(exc):
-                # Deleted in the T3 GUI; stop mirroring it forever.
                 log.info("mirror: thread %s gone from T3; unregistering", thread_id)
                 mirror.remove(thread_id)
             else:
                 log.warning("mirror: snapshot failed for %s", thread_id, exc_info=True)
             continue
-        # A turn emits one assistant message per text segment between tool
-        # calls; only the turn's FINAL message (latestTurn.assistantMessageId)
-        # belongs in Slack — intermediate status notes are skipped, unledgered.
-        latest = thread.get("latestTurn") or {}
-        final_assistant_id = (
-            latest.get("assistantMessageId") if latest.get("state") == "completed" else None
-        )
-        for msg in thread.get("messages", []):
+        thread = projection.get("thread") or {}
+        if thread.get("deletedAt"):
+            # Deleted in the T3 GUI (soft delete); stop mirroring it forever.
+            log.info("mirror: thread %s deleted in T3; unregistering", thread_id)
+            mirror.remove(thread_id)
+            continue
+        # Only a completed run's final assistant message belongs in Slack;
+        # intermediate narration between tool calls is skipped, unledgered.
+        finals = set()
+        for run in projection.get("runs", []):
+            if run.get("status") == "completed":
+                reply = final_reply(projection, run.get("id"))
+                if reply is not None:
+                    finals.add(reply["id"])
+        for msg in projection.get("messages", [])[-_TAIL_MESSAGES:]:
             role = msg.get("role")
             mid = msg.get("id", "")
             if msg.get("streaming") or not mid:
                 continue
-            if role == "assistant" and mid != final_assistant_id:
+            if role == "assistant" and mid not in finals:
                 continue
             if role not in ("user", "assistant"):
                 continue
@@ -102,8 +116,11 @@ def _sweep(t3: T3Client, slack: WebClient, mirror: MirrorStore, owner: str) -> N
             mirror.set_settled_notice(thread_id, settled_at)
             # Only the (not settled -> settled) edge is worth a post. A settledAt
             # that shifts while the thread stays settled -- T3 filling the field a
-            # beat after the override -- updates the record silently.
-            if settled_at and previous is None:
+            # beat after the override -- updates the record silently, and so does
+            # a settle that is long past (one that predates the mirror seeing it,
+            # e.g. surfaced by T3's v1 -> v2 history import).
+            if (settled_at and previous is None
+                    and _age_secs(thread.get("settledAt") or "") < _SETTLE_NOTICE_MAX_AGE_SECS):
                 try:
                     _post(slack, entry["channel"], entry["thread_ts"],
                           f"_{owner} settled this chat. To unsettle this chat, simply reply._")

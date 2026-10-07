@@ -36,7 +36,8 @@ _IGNORED_SUBTYPES = {
     "channel_join", "channel_leave", "thread_broadcast",
 }
 
-# T3's PROVIDER_SEND_TURN_MAX_ATTACHMENTS (packages/contracts/src/orchestration.ts).
+# 8 x T3's 10 MB per-image cap = its 80 MB per-message image total
+# (PROVIDER_SEND_TURN_MAX_TOTAL_IMAGE_BYTES, packages/contracts/src/chatAttachment.ts).
 _MAX_T3_ATTACHMENTS = 8
 
 
@@ -402,7 +403,7 @@ def build_app(config: Settings | LiveSettings) -> App:
 
             if cfg.backend == "t3" and t3_client and mirror:
                 # Slack thread <-> T3 thread, 1:1, deterministic id (so resume
-                # survives a lost sessions.json). thread.turn.start has no
+                # survives a lost sessions.json). message.dispatch has no
                 # system-prompt field, so persona and protocol both come from the
                 # project's CLAUDE.md (T3 spawns with setting sources
                 # user,project,local) and only the routing header rides along.
@@ -412,10 +413,9 @@ def build_app(config: Settings | LiveSettings) -> App:
                 # the agent gets it either way, just less cheaply.
                 thread_id = resume or f"slack-{channel_id}-{thread_ts.replace('.', '-')}"
 
-                # Inline any downloaded images as real T3 attachments (T3 has no
-                # separate upload endpoint -- the bytes ride along as a base64
-                # data URL) so they render in the T3 GUI instead of only being a
-                # file-path note in the prompt text.
+                # Send any downloaded images as real T3 attachments (run_turn
+                # uploads them) so they render in the T3 GUI instead of only
+                # being a file-path note in the prompt text.
                 attachments: list[dict] = []
                 for p in local_paths:
                     try:
@@ -504,7 +504,7 @@ def build_app(config: Settings | LiveSettings) -> App:
                     is_new=resume is None,
                     project_id=cfg.t3_project_id or "",
                     model=cfg.t3_model,
-                    attachments=attachments,
+                    images=attachments,
                     title=f"#{channel_name}: {' '.join((text or 'attachment').split())[:60]}",
                     client=t3_client,
                     mirror=mirror,
