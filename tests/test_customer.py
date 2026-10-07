@@ -234,3 +234,47 @@ def test_holding_line_claims_no_success():
     low = customer.HOLDING_LINE.lower()
     assert "putting together an update" in low
     assert not any(w in low for w in ("done", "live", "fixed", "published", "deployed"))
+
+
+# --- review fixes -------------------------------------------------------------
+
+
+@pytest.mark.parametrize("text", [
+    "see /workspace/app/main.py", "edit /app/main.py", "in /Users/dan/project/main.py",
+    "at /opt/site/index.html", "./src/util.ts", "../lib/thing.py",
+])
+def test_gate_catches_absolute_and_relative_source_paths(text):
+    assert customer.leak_reasons(text), text
+
+
+@pytest.mark.parametrize("text", [
+    "the /settings page", "Mon/Tue", "and/or", "Node.js", "the /billing/invoices page",
+])
+def test_gate_still_passes_route_like_prose(text):
+    assert customer.leak_reasons(text) == []
+
+
+def test_progress_text_gates_the_original_multiline_text_before_flattening():
+    out = customer.progress_text("Looking at it\n    at render (page.js:10:5)", 5, 1)
+    assert "page.js" not in out and customer._GENERIC_NARRATION in out
+
+
+def test_progress_text_never_shows_a_marker_bearing_message():
+    final = "technical half\n\n### Message for the customer\nAll done."
+    out = customer.progress_text(final, 5, 1)
+    assert "technical half" not in out and customer._GENERIC_NARRATION in out
+
+
+def test_private_run_ids_come_from_human_typed_agent_messages_only():
+    runs = [{"id": "r1", "userMessageId": "u1"}, {"id": "r2", "userMessageId": "u2"},
+            {"id": "r3", "userMessageId": "u3"}]
+    human = {"createdBy": "user", "creationSource": "web", "role": "user"}
+    messages = [
+        {**human, "id": "u1", "text": "#agent look", "runId": None},
+        {**human, "id": "u2", "text": "#agentic nope"},
+        {"createdBy": "agent", "creationSource": "provider", "role": "user",
+         "id": "u3", "text": "#agent report"},
+        {**human, "id": "u4", "text": "#agent steer", "runId": "r2"},
+    ]
+    assert customer.private_run_ids(messages, runs) == {"r1", "r2"}
+    assert customer.is_private("  #Agent: hi") and not customer.is_private("hi #agent")

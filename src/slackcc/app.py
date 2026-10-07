@@ -575,7 +575,12 @@ def build_app(config: Settings | LiveSettings) -> App:
                 # a neutral line that claims nothing, and the owners get the
                 # raw text. The customer never sees error text or a tool name.
                 source, final, why = "holding", customer.HOLDING_LINE, None
-                if result.ok:
+                if result.private:
+                    # Dan steered a `#agent` message into this run: its reply is
+                    # for him. Leave the placeholder as a neutral note (deleting
+                    # it would look like the bot vanished) and tell no one else.
+                    final = "Dan is following up on this directly."
+                elif result.ok:
                     outcome = customer.resolve_final(result.text)
                     if outcome.kind == "block":
                         source, final = "block", outcome.text

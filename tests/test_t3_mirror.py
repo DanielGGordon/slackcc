@@ -894,11 +894,36 @@ def test_customer_threads_keep_ledger_dedupe_against_the_slack_turn(tmp_path):
     assert slack.calls == []
 
 
-def test_channel_not_in_live_settings_is_treated_as_technical(tmp_path):
+def test_unconfigured_channel_under_live_settings_delivers_nothing(tmp_path):
+    """A customer channel removed from config must not fall back to technical
+    delivery (it would forward `#agent` messages and full replies)."""
+    mirror = make_mirror(tmp_path, channel="Cunknown")
+    proj = projection(runs=[run()], messages=[
+        old_msg("u1", "user", "#agent secret", run_id=None),
+        old_msg("a1", "assistant", "full technical reply")])
+    slack, _, ledger = sweep(tmp_path, proj, mirror=mirror)
+    assert slack.calls == [] and ledger_of(ledger) == []
+    assert not mirror.is_posted("t1", "u1") and not mirror.is_posted("t1", "a1")
+
+
+def test_without_live_settings_every_thread_stays_technical(tmp_path):
     mirror = make_mirror(tmp_path, channel="Cunknown")
     proj = projection(runs=[run()], messages=[old_msg("a1", "assistant", "plain old reply")])
-    slack, _, _ = sweep(tmp_path, proj, mirror=mirror)
+    slack = CustomerSlack()
+    t3_mirror._sweep(FakeT3Client({"t1": proj}), slack, mirror, owner="Dan")
     assert [c["text"] for c in slack.calls] == ["plain old reply"]
+
+
+def test_private_run_stays_private_when_its_message_is_past_the_tail_window(tmp_path):
+    fillers = [old_msg(f"a-mid{i}", "assistant", f"narration {i}")
+               for i in range(t3_mirror._TAIL_MESSAGES + 20)]
+    proj = projection(
+        runs=[run(user_message_id="u1")],
+        messages=[old_msg("u1", "user", "#agent dig in", run_id=None), *fillers,
+                  old_msg("a-final", "assistant", BLOCK_FINAL)])
+    slack, mirror, _ = sweep(tmp_path, proj)
+    assert slack.calls == []
+    assert mirror.is_posted("t1", "a-final")
 
 
 def test_settle_notice_still_fires_on_customer_threads(tmp_path):

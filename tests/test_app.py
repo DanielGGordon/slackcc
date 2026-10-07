@@ -2074,3 +2074,24 @@ def test_mirror_is_started_with_live_settings_and_the_ledger(make_env):
     [(args, kwargs)] = env.mirror_start_calls
     assert kwargs["live"] is env.app.slackcc_live
     assert isinstance(kwargs["ledger"], app_mod.customer.Ledger)
+
+
+def test_customer_turn_steered_private_posts_nothing_from_the_reply(make_env):
+    env = customer_env(make_env)
+    env.backend_t3_result["value"] = TurnResult(
+        ok=True, text=GOOD_FINAL, session_id="s", message_id="a9", private=True)
+    call_handle(env, make_event(channel="Ccust", user="Uowner", ts="60.1"))
+
+    shown = env.client.chat_update_calls[-1]["text"]
+    assert shown == "Dan is following up on this directly."
+    assert "booking page" not in shown
+    assert env.client.chat_postMessage_calls == []   # no owner DM either
+    [entry] = ledger_entries(env, "60.1")
+    assert entry["source"] == "holding" and entry["text"] == shown
+
+
+def test_technical_channel_ignores_the_private_flag(make_env):
+    env = make_env()
+    env.backend_t3_result["value"] = TurnResult(ok=True, text="plain", session_id="s", private=True)
+    call_handle(env, make_event(channel="Ct3", user="Uowner", ts="60.2"))
+    assert env.client.chat_update_calls[-1]["text"] == "plain"

@@ -102,6 +102,9 @@ def _customer_progress(projection: dict, run_id: str, elapsed: float) -> str:
     """The same live view for a customer channel: no tool label (it is file
     names and commands), the newest narration only if it passes the leak gate,
     and time + step count (the run's tool-type turn items) instead."""
+    # The newest segment only: if that is the final in progress (it carries the
+    # customer-block marker) progress_text falls back to its generic line
+    # rather than reaching back to older narration.
     narration = ""
     for msg in projection.get("messages", []):
         if msg.get("role") == "assistant" and msg.get("runId") == run_id:
@@ -334,6 +337,8 @@ def run_turn(
         if reply_streaming(projection, run_id):
             continue  # terminal, but the last segment hasn't landed yet
         reply = final_reply(projection, run_id)
+        private = run_id in customer_voice.private_run_ids(
+            projection.get("messages", []), projection.get("runs", []))
         text = ""
         if reply is not None:
             text = reply["text"].strip()
@@ -342,12 +347,14 @@ def run_turn(
 
         if status == "completed":
             return TurnResult(ok=True, text=text, session_id=thread_id,
-                              message_id=reply["id"] if reply is not None else None)
+                              message_id=reply["id"] if reply is not None else None,
+                              private=private)
         return TurnResult(
             ok=False,
             text=text,
             session_id=thread_id,
             error=f"T3 run ended in state '{status}'",
+            private=private,
         )
 
     _interrupt(client, thread_id, run_id)

@@ -1010,3 +1010,47 @@ def test_approval_wait_callback_error_does_not_kill_the_turn(tmp_path, monkeypat
     result = go(client, mirror, thread_id, timeout=5, on_approval_wait=boom)
 
     assert result.ok is True
+
+
+# --- review fixes -------------------------------------------------------------
+
+
+def test_customer_progress_never_leaks_the_streaming_final_with_the_marker(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    thread_id = "t3-thread-customer-final-leak"
+    mirror = make_mirror(tmp_path, thread_id)
+    client = FakeT3Client(projections=[
+        running(narration=["Adding the price.",
+                           "Changed the handler.\n\n### Message for the customer\nAll set."]),
+        completed(),
+    ])
+    updates: list[str] = []
+
+    go(client, mirror, thread_id, on_progress=updates.append, customer=True)
+
+    assert "handler" not in updates[0] and "All set" not in updates[0]
+    assert "Working through it now." in updates[0]
+
+
+def test_run_followed_by_a_human_agent_message_is_flagged_private(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    thread_id = "t3-thread-private"
+    mirror = make_mirror(tmp_path, thread_id)
+
+    def steered(mid):
+        proj = projection(mid, "completed")
+        proj["messages"].append({"id": "gui-1", "role": "user", "runId": RUN_ID,
+                                 "text": "#agent also check logs", "streaming": False,
+                                 "createdBy": "user", "creationSource": "web",
+                                 "updatedAt": "2026-10-07T12:00:00Z"})
+        return proj
+
+    client = FakeT3Client(projections=[steered])
+    assert go(client, mirror, thread_id).private is True
+
+
+def test_ordinary_run_is_not_private(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    thread_id = "t3-thread-not-private"
+    mirror = make_mirror(tmp_path, thread_id)
+    assert go(FakeT3Client(projections=[completed()]), mirror, thread_id).private is False

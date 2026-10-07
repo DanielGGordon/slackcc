@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .outbound import scrub
+from .t3 import typed_by_human
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +40,10 @@ _MARKER_LINE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]*message for the customer[ \t]
 # Posted instead of a block we can't use. Must not claim anything succeeded.
 HOLDING_LINE = ("I've finished working on this and I'm putting together an update "
                 "for you.")
+
+
+def has_marker(text: str) -> bool:
+    return _MARKER_LINE.search(text or "") is not None
 
 
 def extract_block(final_text: str) -> str | None:
@@ -61,14 +66,14 @@ _GATE: list[tuple[str, re.Pattern]] = [
     ("code block", re.compile(r"```|~~~")),
     # a path: dir segments then a file with a code extension ...
     ("file path", re.compile(
-        rf"(?<![\w/.-])(?:[\w.-]+/)+[\w.-]+\.(?:{_CODE_EXT})\b", re.IGNORECASE)),
+        rf"(?<![\w/.-])/?(?:[\w.-]+/)+[\w.-]+\.(?:{_CODE_EXT})\b", re.IGNORECASE)),
     # ... a bare file name (not .js: "Node.js", "Next.js" are product names) ...
     ("file name", re.compile(
         rf"(?<![\w/.-])[\w-]+\.(?:{_CODE_EXT.replace('jsx?|', 'jsx|')})\b", re.IGNORECASE)),
     # ... a conventional source dir, or a system path. "/settings" is neither.
     ("file path", re.compile(
         r"(?<![\w/.-])(?:src|lib|node_modules|components|tests|dist|packages|\.github|\.git)/[\w.-]+"
-        r"|(?<![\w.])(?:/(?:home|usr|etc|var|opt|tmp|srv|root)/|~/)[\w.-]")),
+        r"|(?<![\w.])(?:/(?:home|usr|etc|var|opt|tmp|srv|root|workspace|Users|mnt)/|~/)[\w.-]")),
     ("pull request reference", re.compile(
         r"\b(?:PR|(?i:pull[ -]request))s?\s*#?\s*\d+|\(#\d{2,}\)"
         r"|github\.com/\S+/(?:pull|commit|issues)/")),
@@ -126,6 +131,28 @@ def resolve_final(final_text: str) -> Outcome:
     return Outcome("block", text=block)
 
 
+# --- #agent: Dan talking to the agent only ---------------------------------------
+
+# "#agent", then whitespace and/or a colon (or nothing). "#agentic" is not it.
+_PRIVATE = re.compile(r"\s*#agent(?![\w-])[\s:]*", re.IGNORECASE)
+
+
+def is_private(text: str) -> bool:
+    return _PRIVATE.match(text or "") is not None
+
+
+def private_run_ids(messages: list[dict], runs: list[dict]) -> set[str]:
+    """Runs started (or steered into) by a human-typed `#agent` message: their
+    replies are for Dan alone. Found the way backend_t3 finds its own run: by
+    the message's `runId`, or the run's `userMessageId`. Pass the FULL
+    projection lists, not a window: a long run's first message must still count."""
+    private = {m["id"] for m in messages
+               if m.get("role") == "user" and m.get("id") and typed_by_human(m)
+               and is_private(m.get("text"))}
+    return ({m["runId"] for m in messages if m.get("id") in private and m.get("runId")}
+            | {r["id"] for r in runs if r.get("userMessageId") in private})
+
+
 # --- progress ----------------------------------------------------------------
 
 _GENERIC_NARRATION = "Working through it now."
@@ -136,8 +163,12 @@ def progress_text(narration: str, elapsed_secs: float, steps: int, *,
     """The customer-safe placeholder body: the agent's newest narration if it
     passes the gate (else a generic line) plus elapsed time and step count.
     Minute granularity, so the text only changes when something real does."""
-    narration = " ".join((narration or "").split())
-    if not narration or leak_reasons(narration):
+    # Gate the text as the agent wrote it: flattening first would defeat the
+    # line-anchored stack-trace patterns. A message carrying the customer-block
+    # marker is the technical final, never narration.
+    raw = narration or ""
+    narration = " ".join(raw.split())
+    if not narration or leak_reasons(raw) or has_marker(raw):
         narration = _GENERIC_NARRATION
     elif len(narration) > clip:
         narration = narration[: clip - 1].rstrip() + "…"

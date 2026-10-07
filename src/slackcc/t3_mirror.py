@@ -27,7 +27,6 @@ Design constraints:
 from __future__ import annotations
 
 import logging
-import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -58,11 +57,6 @@ def _age_secs(iso: str) -> float:
     return (datetime.now(timezone.utc) - ts).total_seconds()
 
 
-# "#agent", then whitespace and/or a colon (or nothing): Dan talking to the
-# agent only. "#agentic" is not it.
-_PRIVATE = re.compile(r"\s*#agent(?![\w-])[\s:]*", re.IGNORECASE)
-
-
 def _post(slack: WebClient, channel: str, thread_ts: str, text: str) -> str | None:
     """Post (chunked); returns the Slack ts of the first chunk."""
     first = None
@@ -71,17 +65,6 @@ def _post(slack: WebClient, channel: str, thread_ts: str, text: str) -> str | No
                                       text=text[i:i + _SLACK_CHUNK])
         first = first or (resp or {}).get("ts")
     return first
-
-
-def _private_runs(messages: list[dict], runs: list[dict]) -> set[str]:
-    """Runs started by a human-typed `#agent` message: their replies are for
-    Dan alone. A run is found the way backend_t3 finds its own: by the
-    message's `runId`, or the run's `userMessageId`."""
-    private = {m["id"] for m in messages
-               if m.get("role") == "user" and m.get("id") and typed_by_human(m)
-               and _PRIVATE.match(m.get("text") or "")}
-    return ({m["runId"] for m in messages if m.get("id") in private and m.get("runId")}
-            | {r["id"] for r in runs if r.get("userMessageId") in private})
 
 
 def _customer_delivery(slack: WebClient, mirror: MirrorStore, thread_id: str, entry: dict,
@@ -93,7 +76,7 @@ def _customer_delivery(slack: WebClient, mirror: MirrorStore, thread_id: str, en
     key = customer.thread_key(chan, ts)
     mirror.mark_posted(thread_id, [mid])
     if msg.get("role") == "user":
-        if _PRIVATE.match(text):
+        if customer.is_private(text):
             log.info("mirror: #agent message %s on %s is private; not forwarded", mid, thread_id)
             return
         text = scrub(text)[0]
@@ -119,6 +102,9 @@ def _customer_delivery(slack: WebClient, mirror: MirrorStore, thread_id: str, en
                           reason=outcome.why, raw=text)
 
 
+_warned_unconfigured: set[str] = set()  # log once per thread, not every sweep
+
+
 def _sweep(t3: T3Client, slack: WebClient, mirror: MirrorStore, owner: str, *,
            live=None, ledger: customer.Ledger | None = None) -> None:
     """`live` (LiveSettings) says which channels are customer-audience; without
@@ -141,9 +127,21 @@ def _sweep(t3: T3Client, slack: WebClient, mirror: MirrorStore, owner: str, *,
             continue
         settings = live.current if live is not None else None
         cfg = settings.channel(entry["channel"]) if settings is not None else None
+        if settings is not None and cfg is None:
+            # Live config no longer knows this channel (removed, or reloaded
+            # away from customer): we can't tell who reads it, so say nothing.
+            # Messages stay unledgered and go out if the channel comes back.
+            if thread_id not in _warned_unconfigured:
+                _warned_unconfigured.add(thread_id)
+                log.warning("mirror: channel %s of thread %s is not in the live config; "
+                            "delivering nothing for it", entry["channel"], thread_id)
+            continue
         voice = cfg is not None and cfg.audience == "customer" and ledger is not None
         tail = projection.get("messages", [])[-_TAIL_MESSAGES:]
-        private_runs = _private_runs(tail, projection.get("runs", [])) if voice else set()
+        # Whole projection, not the tail: only delivery is windowed.
+        private_runs = (customer.private_run_ids(projection.get("messages", []),
+                                                 projection.get("runs", []))
+                        if voice else set())
         # Only a completed run's final assistant message belongs in Slack;
         # intermediate narration between tool calls is skipped, unledgered.
         finals = set()
