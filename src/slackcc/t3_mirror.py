@@ -34,6 +34,10 @@ _POLL_SECS = 5.0
 _GRACE_SECS = 10.0
 _SLACK_CHUNK = 3800  # Slack rejects messages over ~4k chars
 _SETTLE_NOTICE_MAX_AGE_SECS = 3600.0
+# Only a thread's newest messages are considered. Older ones were handled on
+# earlier sweeps, and their ids may have aged out of the ledger (_POSTED_CAP
+# in t3.py) -- rescanning them would repost long-delivered history.
+_TAIL_MESSAGES = 200
 
 
 def _age_secs(iso: str) -> float:
@@ -75,7 +79,7 @@ def _sweep(t3: T3Client, slack: WebClient, mirror: MirrorStore, owner: str) -> N
                 reply = final_reply(projection, run.get("id"))
                 if reply is not None:
                     finals.add(reply["id"])
-        for msg in projection.get("messages", []):
+        for msg in projection.get("messages", [])[-_TAIL_MESSAGES:]:
             role = msg.get("role")
             mid = msg.get("id", "")
             if msg.get("streaming") or not mid:

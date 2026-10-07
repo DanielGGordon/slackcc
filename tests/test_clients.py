@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -251,6 +252,27 @@ def test_dispatch_answers_ping_and_ignores_other_request_ids():
         client = T3Client(srv.url, token="tok", timeout=5)
         assert client.dispatch({"type": "x"}) == {"sequence": 3}
     assert {"_tag": "Pong"} in srv.received
+
+
+def test_dispatch_times_out_even_while_the_server_keeps_pinging():
+    """Pings must not reset the call's clock: a stalled command still fails."""
+    def respond(req):
+        return [{"_tag": "Ping"}] * 40
+
+    def slow_pings(req):
+        import time as _time
+        for frame in respond(req):
+            _time.sleep(0.1)
+            yield frame
+
+    with _WsServer(slow_pings) as srv:
+        client = T3Client(srv.url, token="tok", timeout=1)
+        started = time.monotonic()
+        with pytest.raises(T3Error) as excinfo:
+            client.dispatch({"type": "x"})
+        elapsed = time.monotonic() - started
+    assert "timed out" in str(excinfo.value)
+    assert elapsed < 3
 
 
 def test_dispatch_typed_failure_raises_t3error_with_server_message():

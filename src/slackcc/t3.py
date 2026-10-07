@@ -25,6 +25,7 @@ from __future__ import annotations
 import itertools
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -91,6 +92,9 @@ class T3Client:
         A connection per call keeps the client stateless; commands are rare
         (a handful per Slack turn) next to the HTTP polling."""
         request_id = str(next(self._ids))
+        # One deadline for the whole call: a server that keeps pinging must
+        # not keep a stalled command alive past `timeout`.
+        deadline = time.monotonic() + self.timeout
         ws_url = (self.base_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
                   + f"/ws?orchestrationProtocol={PROTOCOL_VERSION}")
         try:
@@ -101,7 +105,10 @@ class T3Client:
                 ws.send(json.dumps({"_tag": "Request", "id": request_id, "tag": tag,
                                     "payload": payload, "headers": []}))
                 while True:
-                    frame = json.loads(ws.recv(timeout=self.timeout))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError
+                    frame = json.loads(ws.recv(timeout=remaining))
                     for msg in frame if isinstance(frame, list) else [frame]:
                         kind = msg.get("_tag")
                         if kind == "Ping":

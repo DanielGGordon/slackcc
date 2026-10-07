@@ -592,3 +592,23 @@ def test_settled_at_appearing_late_does_not_reannounce(tmp_path):
 
     assert len(slack.calls) == 1
     assert mirror.settled_notice("t1") == late
+
+
+def test_long_thread_beyond_ledger_cap_does_not_repost_old_history(tmp_path):
+    """300 delivered exchanges = 600 ids > the 500-id ledger. Only the newest
+    messages are scanned, so ids that aged out of the ledger never repost."""
+    mirror = make_mirror(tmp_path)
+    runs, messages = [], []
+    for i in range(300):
+        run_id = f"run:thread:t1:ordinal:{i}"
+        runs.append(run(run_id, user_message_id=f"u{i}"))
+        messages += [old_msg(f"u{i}", "user", f"question {i}", run_id=run_id),
+                     old_msg(f"a{i}", "assistant", f"answer {i}", run_id=run_id)]
+        mirror.mark_posted("t1", [f"u{i}", f"a{i}"])
+    t3 = FakeT3Client({"t1": projection(runs=runs, messages=messages)})
+    slack = FakeSlack()
+
+    t3_mirror._sweep(t3, slack, mirror, owner="dan")
+    t3_mirror._sweep(t3, slack, mirror, owner="dan")
+
+    assert slack.calls == []
