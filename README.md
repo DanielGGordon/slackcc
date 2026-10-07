@@ -68,11 +68,48 @@ Slack channel ──(Socket Mode)──> slackcc daemon ──┬──> backend
   not downgrade it. (Start a new thread to change model.)
 - **Bidirectional mirror (t3 backend):** messages typed into the T3 GUI on a
   Slack-originated thread are posted back into the Slack thread
-  ("_Owner said to the agent:_ …"), and replies land in both places. Only
+  ("_Owner said to the agent:_ …"; customer channels differ, see below), and replies land in both places. Only
   messages T3 records as human-typed (web/mobile) get that label; agent text
   T3 files as a user message (subagent reports, agent sends) is not posted. Settling
   a chat in the T3 UI posts a notice into the Slack thread; replying in Slack
   un-settles it.
+- **Customer channels (`audience: "customer"`, per channel):** for channels
+  whose Slack readers are non-coders. The default, `"technical"`, changes
+  nothing. In a customer channel every turn -- even one Dan triggers from
+  Slack -- runs in customer mode:
+  - *Block-only replies.* The agent ends its final message with a
+    `### Message for the customer` heading and a short plain-language block;
+    only the text after the **last** such heading reaches Slack. Dan sees the
+    technical summary and the block together in T3. Only the run's final
+    assistant message is parsed (never user-role messages such as subagent reports).
+  - *Leak gate (`customer.py`).* The block is checked deterministically for code
+    fences, file paths / file names, PR numbers, commit hashes, stack traces and
+    branch names (narrow on purpose; ordinary prose like "the /settings page" passes).
+  - *Fallback.* No block, or a block that trips the gate: Slack gets "I've
+    finished working on this and I'm putting together an update for you." (it
+    claims no success) and every owner gets a DM with the agent's raw final
+    text, the reason and thread links. A failed run likewise shows the customer
+    a neutral line, never error text. No LLM translation.
+  - *Progress.* The placeholder never shows the tool line. It shows the agent's
+    newest narration if it passes the gate (else "Working through it now."),
+    then "Still working on it - about 4 minutes in, 9 steps so far." (steps = tool
+    calls this run).
+  - *What Slack was told.* `.state/customer_ledger/<slack-thread-id>.jsonl`
+    records each final-level message Slack received, one JSON object per line:
+    `{ts, source: block|holding|dan_forward, text, slack_ts?, t3_message_id?}`.
+    The last four are prepended to each customer-mode prompt as `[What the
+    customer has been told so far ...]`, so the agent keeps the customer's view
+    after context compaction (it shows in T3 too). Each file is trimmed past 200 lines.
+  - *Dan in the T3 GUI.* Messages Dan types into a customer thread are
+    forwarded to Slack by default, verbatim, as "*Dan:* text". **Start a message
+    with `#agent`** (any case, optional colon) to keep it private: it is not
+    forwarded and the run it triggers posts nothing to Slack. A GUI-triggered
+    run's final posts only its block; if it lacks one the owners are DM'd once
+    and Slack stays quiet.
+
+  Auto-ship (merge and deploy a guest's change) stays keyed on `role=guest`;
+  the plain-reply and block rules key on the channel's audience, so a guest in
+  a technical channel is still auto-shipped but gets technical replies.
 - **Outbound scrubbing:** every message posted to Slack is scanned and
   secret-shaped strings (tokens, keys, JWTs) are redacted.
 - **Trust boundary:** pps is the screen, so a message that reaches the agent is
@@ -81,8 +118,8 @@ Slack channel ──(Socket Mode)──> slackcc daemon ──┬──> backend
   in `<<<EXTERNAL_UNTRUSTED_CONTENT>>>` markers plus the matching directive
   (`sanitize.py`).
 - **Bridge protocol lives outside the prompt:** each turn carries one routing
-  comment (`<!-- slack channel=… thread=… role=owner|guest -->`; a missing
-  `role` means owner) that the T3 GUI hides from the reader, plus a human attribution line (`Berish Perlman from #sofer-ai: …`,
+  comment (`<!-- slack channel=… thread=… role=owner|guest audience=customer|technical -->`;
+  a missing `role` means owner, a missing `audience` means technical) that the T3 GUI hides from the reader, plus a human attribution line (`Berish Perlman from #sofer-ai: …`,
   names resolved via `users.info`/`conversations.info` and cached). How to
   reply, upload files, and post extra messages ships with the package
   (`src/slackcc/data/slack-bridge.md`) and reaches the agent through its system
@@ -139,6 +176,8 @@ id (`backend: "t3"`) or the project `cwd` + `persona` + `allowed_tools`
 (`backend: "claude"`; keep it least-privilege for friend-facing channels).
 Add `"require_mention": true` if the channel is also used for unrelated chat
 and the bot should only speak up when tagged (see "Mention gating" above).
+Set `"audience": "customer"` on channels read by non-coders (see "Customer
+channels" above); leave it off for technical channels.
 Put your own Slack member id in `config/senders.json` as `role: "owner"` —
 everyone else defaults to a screened, approval-required guest.
 
@@ -250,6 +289,7 @@ src/slackcc/
   backend_t3.py T3 Code turn runner (dispatch over WebSocket RPC, poll over HTTP)
   t3.py         T3 client (orchestration protocol v2) + mirror ledger store
   t3_mirror.py  background poller: T3 GUI turns -> Slack thread
+  customer.py   customer voice: block parser, leak gate, told-so-far ledger, owner alert
   pps.py        client for the Prompt Protection Service judge
   outbound.py   secret scrubbing for everything posted to Slack
   config.py     env + channels.json + senders.json loading, per-sender policy,
@@ -264,6 +304,7 @@ src/slackcc/
 config/channels.example.json
 config/senders.example.json
 .state/pps_overrides.json   per-thread pending owner asks + granted requests
+.state/customer_ledger/     per-thread JSONL of what customer-channel Slack was told
 .state/config-backups/      the files as they were before each config API write (last 20)
 BACKLOG.md
 ```

@@ -2034,7 +2034,7 @@ def test_next_customer_turn_is_prefixed_with_what_the_customer_was_told(make_env
     env = customer_env(make_env)
     env.backend_t3_result["value"] = TurnResult(ok=True, text=GOOD_FINAL, session_id="s")
     call_handle(env, make_event(channel="Ccust", user="Uguest", ts="51.0", text="first"))
-    assert "[What the customer has been told" not in env.backend_t3_calls[0]["prompt"]
+    assert "told so far in Slack (oldest first)" not in env.backend_t3_calls[0]["prompt"]
 
     call_handle(env, make_event(channel="Ccust", user="Uguest", ts="51.1", thread_ts="51.0",
                                 text="and the colours?"))
@@ -2058,7 +2058,7 @@ def test_ledger_note_is_capped_at_the_last_four_entries(make_env):
 def test_technical_channel_gets_no_ledger_note_and_no_ledger_file(make_env):
     env = make_env()
     call_handle(env, make_event(channel="Ct3", user="Uowner", ts="53.0"))
-    assert "[What the customer" not in env.backend_t3_calls[0]["prompt"]
+    assert "told so far in Slack (oldest first)" not in env.backend_t3_calls[0]["prompt"]
     assert not (env.sessions_path.parent / "customer_ledger").exists()
 
 
