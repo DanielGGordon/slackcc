@@ -484,3 +484,56 @@ def test_owner_ids_and_t3_thread_url(tmp_path):
     from dataclasses import replace
     with_gui = replace(settings, t3_gui_url="https://host:7443/")
     assert with_gui.t3_thread_url("slack-C1-1-2") == "https://host:7443/primary/slack-C1-1-2"
+
+
+# ---------------------------------------------------------------------------
+# per-sender t3_model (guest default = Sonnet 5.5)
+# ---------------------------------------------------------------------------
+
+SONNET55 = {"instanceId": "claudeAgent", "model": "claude-sonnet-5-5"}
+OPUS = {"instanceId": "claudeAgent", "model": "claude-opus-x"}
+
+
+def _chan(tmp_path):
+    return ChannelConfig(channel_id="C1", project="p", cwd=str(tmp_path), backend="t3",
+                         t3_project_id="proj")
+
+
+def test_t3_model_guest_builtin_default_and_owner_keeps_channel(tmp_path):
+    path = tmp_path / "senders.json"
+    _write_json(path, {"senders": {"UO": {"role": "owner"}, "UG": {"role": "guest"}}})
+    senders, defaults = load_senders(path)
+    settings = _make_settings(tmp_path, senders=senders, guest_defaults=defaults)
+    cfg = _chan(tmp_path)
+    assert settings.t3_model_for(senders["UO"], cfg) == cfg.t3_model
+    assert settings.t3_model_for(senders["UG"], cfg) == SONNET55
+    assert settings.t3_model_for(settings.sender_policy("UNKNOWN"), cfg) == SONNET55
+
+
+def test_t3_model_precedence_sender_then_guest_defaults(tmp_path):
+    path = tmp_path / "senders.json"
+    _write_json(path, {
+        "senders": {"UA": {"role": "guest", "t3_model": OPUS},
+                    "UB": {"role": "guest"},
+                    "UO": {"role": "owner", "t3_model": OPUS}},
+        "guest_defaults": {"t3_model": {"instanceId": "claudeAgent", "model": "m2"}},
+    })
+    senders, defaults = load_senders(path)
+    settings = _make_settings(tmp_path, senders=senders, guest_defaults=defaults)
+    cfg = _chan(tmp_path)
+    assert settings.t3_model_for(senders["UA"], cfg) == OPUS
+    assert settings.t3_model_for(senders["UB"], cfg)["model"] == "m2"
+    assert settings.t3_model_for(settings.sender_policy("UX"), cfg)["model"] == "m2"
+    # an owner never takes a guest model, even one set on their own entry
+    assert settings.t3_model_for(senders["UO"], cfg) == cfg.t3_model
+
+
+@pytest.mark.parametrize("bad", ["sonnet", {"model": "x"}, {"instanceId": "a", "model": ""}, []])
+def test_t3_model_invalid_raises(tmp_path, bad):
+    path = tmp_path / "senders.json"
+    _write_json(path, {"senders": {"UG": {"t3_model": bad}}})
+    with pytest.raises(ValueError, match="t3_model"):
+        load_senders(path)
+    _write_json(path, {"guest_defaults": {"t3_model": bad}})
+    with pytest.raises(ValueError, match="t3_model"):
+        load_senders(path)

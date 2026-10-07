@@ -58,6 +58,14 @@ Slack channel ──(Socket Mode)──> slackcc daemon ──┬──> backend
   are still judged, but the judge sees the granted request as fenced,
   data-only context, so plain follow-ups to it pass while unrelated asks are
   still declined. State: `.state/pps_overrides.json`.
+- **Guest model (t3 backend):** non-owner conversations start on Sonnet 5.5
+  (`claude-sonnet-5-5`); owners keep the channel's `t3_model`. Override with a
+  `t3_model` object (`{"instanceId": …, "model": …}`) on a `senders.json`
+  entry or in `guest_defaults` (precedence: sender, `guest_defaults`, built-in).
+  T3 fixes a thread's model when it is created, so **whoever starts the thread
+  decides it** and it is kept for the thread's life: an owner joining a guest's
+  thread does not upgrade it, and a guest replying in an owner's thread does
+  not downgrade it. (Start a new thread to change model.)
 - **Bidirectional mirror (t3 backend):** messages typed into the T3 GUI on a
   Slack-originated thread are posted back into the Slack thread
   ("_Owner said to the agent:_ …"), and replies land in both places. Settling

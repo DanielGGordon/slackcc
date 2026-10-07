@@ -1879,3 +1879,13 @@ def test_a_swap_updates_the_reserved_sender_names(make_env):
     prompt = env.backend_calls[-1]["prompt"]
     assert "Berish Perlman from" not in prompt
     assert "Uguest" in prompt
+
+
+def test_handle_t3_model_guest_sonnet55_owner_channel_model(make_env):
+    env = make_env()
+    env.pps.queue({"verdict": "allow", "category": None, "reason": ""})
+    call_handle(env, make_event(channel="Ct3", user="Uguest", ts="11.1", text="hi"))
+    call_handle(env, make_event(channel="Ct3", user="Uowner", ts="11.2", text="hi"))
+    guest_call, owner_call = env.backend_t3_calls
+    assert guest_call["model"] == {"instanceId": "claudeAgent", "model": "claude-sonnet-5-5"}
+    assert owner_call["model"] == env.settings.channels["Ct3"].t3_model

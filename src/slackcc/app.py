@@ -503,7 +503,9 @@ def build_app(config: Settings | LiveSettings) -> App:
                     thread_id=thread_id,
                     is_new=resume is None,
                     project_id=cfg.t3_project_id or "",
-                    model=cfg.t3_model,
+                    # Only read when this turn creates the thread: T3 fixes the model
+                    # then, so whoever STARTS a thread decides it for good.
+                    model=settings.t3_model_for(sp, cfg),
                     images=attachments,
                     title=f"#{channel_name}: {' '.join((text or 'attachment').split())[:60]}",
                     client=t3_client,
