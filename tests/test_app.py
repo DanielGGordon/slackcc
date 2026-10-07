@@ -145,7 +145,7 @@ class FakePPS:
 
 
 class FakeT3Client:
-    """Stand-in for T3Client; records dispatch() calls. No HTTP."""
+    """Stand-in for T3Client; records dispatch() calls. No network."""
 
     def __init__(self, base_url, token, timeout=30):
         self.base_url = base_url
@@ -160,7 +160,7 @@ class FakeT3Client:
             raise self.dispatch_error
         return {}
 
-    def thread_snapshot(self, thread_id: str) -> dict:
+    def thread_projection(self, thread_id: str) -> dict:
         return {"thread": {}}
 
 
@@ -936,11 +936,8 @@ def test_handle_t3_backend_attaches_downloaded_image_inline(make_env):
                                  files=files, ts="60.5"))
 
     assert len(env.backend_t3_calls) == 1
-    attachments = env.backend_t3_calls[0]["attachments"]
-    assert len(attachments) == 1
-    assert attachments[0]["type"] == "image"
-    assert attachments[0]["name"] == "shot.png"
-    assert attachments[0]["mimeType"] == "image/png"
+    assert env.backend_t3_calls[0]["images"] == [
+        {"name": "shot.png", "mimeType": "image/png", "data": b"fake-png-bytes"}]
 
 
 def test_handle_t3_backend_does_not_attach_non_image_files(make_env):
@@ -950,7 +947,7 @@ def test_handle_t3_backend_does_not_attach_non_image_files(make_env):
                                  files=files, ts="60.6"))
 
     assert len(env.backend_t3_calls) == 1
-    assert env.backend_t3_calls[0]["attachments"] == []
+    assert env.backend_t3_calls[0]["images"] == []
 
 
 def test_handle_file_download_exception_does_not_kill_the_turn(make_env):
@@ -1347,8 +1344,8 @@ def test_handle_t3_approval_wait_dms_owners_with_links_and_passes_config(make_en
     def run_turn_parked(**kwargs):
         seen.update(kwargs)
         kwargs["on_approval_wait"]([{
-            "kind": "approval.requested", "requestId": "req-1",
-            "requestKind": "command", "detail": "Bash: rm -rf build",
+            "kind": "command", "requestId": "req-1",
+            "requestKind": "command", "prompt": "Bash: rm -rf build", "questions": [],
         }])
         return TurnResult(ok=True, text="done after approval", session_id="sess-t3-1")
 

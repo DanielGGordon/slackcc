@@ -7,6 +7,7 @@ dependencies = [
     "slack-bolt>=1.18",
     "slack-sdk>=3.27",
     "claude-agent-sdk>=0.2.110",
+    "websockets>=13.0",  # T3 orchestration v2 commands are WebSocket RPC
 ]
 
 [project.scripts]

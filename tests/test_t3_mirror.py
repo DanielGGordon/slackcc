@@ -1,6 +1,6 @@
 """Tests for the T3 outbound mirror sweep (`slackcc.t3_mirror._sweep`).
 
-Fully offline: FakeT3Client returns canned thread snapshots (no HTTP), a
+Fully offline: FakeT3Client returns canned v2 thread projections (no HTTP), a
 real MirrorStore backed by a tmp_path JSON file, and FakeSlack records
 chat_postMessage calls instead of hitting the network.
 """
@@ -21,18 +21,18 @@ def iso_now_minus(seconds: float) -> str:
 
 
 class FakeT3Client:
-    """Stands in for T3Client.thread_snapshot; no HTTP involved."""
+    """Stands in for T3Client.thread_projection; no HTTP involved."""
 
-    def __init__(self, snapshots: dict[str, dict] | None = None, errors: dict[str, Exception] | None = None):
-        self.snapshots = snapshots or {}
+    def __init__(self, projections: dict[str, dict] | None = None, errors: dict[str, Exception] | None = None):
+        self.projections = projections or {}
         self.errors = errors or {}
         self.calls: list[str] = []
 
-    def thread_snapshot(self, thread_id: str) -> dict:
+    def thread_projection(self, thread_id: str) -> dict:
         self.calls.append(thread_id)
         if thread_id in self.errors:
             raise self.errors[thread_id]
-        return self.snapshots.get(thread_id, {"thread": {}})
+        return self.projections.get(thread_id, {"thread": {}, "runs": [], "messages": []})
 
 
 class FakeSlack:
@@ -55,30 +55,42 @@ def make_mirror(tmp_path, thread_id="t1", channel="C1", thread_ts="1000.0001") -
     return mirror
 
 
-def old_msg(mid: str, role: str, text: str, streaming: bool = False, age: float = 60.0) -> dict:
+RUN1 = "run:thread:t1:ordinal:1"
+RUN2 = "run:thread:t1:ordinal:2"
+
+
+def run(run_id: str = RUN1, status: str = "completed", user_message_id: str = "u1") -> dict:
+    return {"id": run_id, "status": status, "userMessageId": user_message_id}
+
+
+def old_msg(mid: str, role: str, text: str, streaming: bool = False, age: float = 60.0,
+            run_id: str | None = RUN1) -> dict:
     return {
         "id": mid,
         "role": role,
+        "runId": run_id,
         "text": text,
         "streaming": streaming,
         "updatedAt": iso_now_minus(age),
     }
 
 
-def test_completed_turn_posts_only_final_assistant_message(tmp_path):
-    """Intermediate assistant messages (not the latestTurn's final id) are
-    skipped AND never ledgered as posted."""
+def projection(messages=None, runs=None, **thread) -> dict:
+    return {"thread": thread, "runs": runs if runs is not None else [], "messages": messages or []}
+
+
+def test_completed_run_posts_only_final_assistant_message(tmp_path):
+    """Intermediate assistant messages of a completed run (not its final one)
+    are skipped AND never ledgered as posted."""
     mirror = make_mirror(tmp_path)
-    snapshot = {
-        "thread": {
-            "latestTurn": {"state": "completed", "assistantMessageId": "a2"},
-            "messages": [
-                old_msg("a1", "assistant", "intermediate status note"),
-                old_msg("a2", "assistant", "final answer"),
-            ],
-        }
-    }
-    t3 = FakeT3Client({"t1": snapshot})
+    proj = projection(
+        runs=[run()],
+        messages=[
+            old_msg("a1", "assistant", "intermediate status note"),
+            old_msg("a2", "assistant", "final answer"),
+        ],
+    )
+    t3 = FakeT3Client({"t1": proj})
     slack = FakeSlack()
 
     t3_mirror._sweep(t3, slack, mirror, owner="dan")
@@ -90,17 +102,13 @@ def test_completed_turn_posts_only_final_assistant_message(tmp_path):
     assert mirror.is_posted("t1", "a1") is False
 
 
-def test_running_turn_posts_nothing(tmp_path):
+def test_running_run_posts_nothing(tmp_path):
     mirror = make_mirror(tmp_path)
-    snapshot = {
-        "thread": {
-            "latestTurn": {"state": "running", "assistantMessageId": "a1"},
-            "messages": [
-                old_msg("a1", "assistant", "still working on it"),
-            ],
-        }
-    }
-    t3 = FakeT3Client({"t1": snapshot})
+    proj = projection(
+        runs=[run(status="running")],
+        messages=[old_msg("a1", "assistant", "still working on it")],
+    )
+    t3 = FakeT3Client({"t1": proj})
     slack = FakeSlack()
 
     t3_mirror._sweep(t3, slack, mirror, owner="dan")
@@ -109,18 +117,126 @@ def test_running_turn_posts_nothing(tmp_path):
     assert mirror.is_posted("t1", "a1") is False
 
 
+@pytest.mark.parametrize("status", ["running", "interrupted", "failed"])
+def test_assistant_message_of_non_completed_run_skipped_and_unledgered(tmp_path, status):
+    mirror = make_mirror(tmp_path)
+    proj = projection(
+        runs=[run(RUN1, "completed"), run(RUN2, status, "u2")],
+        messages=[
+            old_msg("a1", "assistant", "first run answer", run_id=RUN1),
+            old_msg("a2", "assistant", "second run partial", run_id=RUN2),
+        ],
+    )
+    t3 = FakeT3Client({"t1": proj})
+    slack = FakeSlack()
+
+    t3_mirror._sweep(t3, slack, mirror, owner="dan")
+
+    assert [c["text"] for c in slack.calls] == ["first run answer"]
+    assert mirror.is_posted("t1", "a1") is True
+    assert mirror.is_posted("t1", "a2") is False
+
+
+def test_multiple_completed_runs_each_post_their_final_reply_once(tmp_path):
+    mirror = make_mirror(tmp_path)
+    proj = projection(
+        runs=[run(RUN1, "completed", "u1"), run(RUN2, "completed", "u2")],
+        messages=[
+            old_msg("a1a", "assistant", "run1 narration", run_id=RUN1),
+            old_msg("a1b", "assistant", "run1 final", run_id=RUN1),
+            old_msg("a2a", "assistant", "run2 narration", run_id=RUN2),
+            old_msg("a2b", "assistant", "run2 final", run_id=RUN2),
+        ],
+    )
+    t3 = FakeT3Client({"t1": proj})
+    slack = FakeSlack()
+
+    t3_mirror._sweep(t3, slack, mirror, owner="dan")
+    t3_mirror._sweep(t3, slack, mirror, owner="dan")  # second sweep must not re-post
+
+    assert [c["text"] for c in slack.calls] == ["run1 final", "run2 final"]
+    assert mirror.is_posted("t1", "a1a") is False
+    assert mirror.is_posted("t1", "a2a") is False
+
+
+def test_v1_imported_history_posts_no_assistant_messages(tmp_path):
+    """T3's v1 -> v2 import yields no runs and runId-less messages: assistant
+    history must not flood Slack, and is not ledgered."""
+    mirror = make_mirror(tmp_path)
+    proj = projection(
+        runs=[],
+        messages=[
+            old_msg("a1", "assistant", "old answer", run_id=None),
+            old_msg("a2", "assistant", "older answer", run_id=None),
+        ],
+    )
+    t3 = FakeT3Client({"t1": proj})
+    slack = FakeSlack()
+
+    t3_mirror._sweep(t3, slack, mirror, owner="dan")
+
+    assert slack.calls == []
+    assert mirror.is_posted("t1", "a1") is False
+    assert mirror.is_posted("t1", "a2") is False
+
+
+def test_assistant_message_with_null_run_id_skipped_even_with_completed_run(tmp_path):
+    mirror = make_mirror(tmp_path)
+    proj = projection(
+        runs=[run()],
+        messages=[
+            old_msg("a0", "assistant", "orphan", run_id=None),
+            old_msg("a1", "assistant", "final answer"),
+        ],
+    )
+    t3 = FakeT3Client({"t1": proj})
+    slack = FakeSlack()
+
+    t3_mirror._sweep(t3, slack, mirror, owner="dan")
+
+    assert [c["text"] for c in slack.calls] == ["final answer"]
+    assert mirror.is_posted("t1", "a0") is False
+
+
+def test_soft_deleted_thread_is_unregistered_and_posts_nothing(tmp_path):
+    mirror = make_mirror(tmp_path)
+    proj = projection(
+        runs=[run()],
+        messages=[
+            old_msg("u1", "user", "hello"),
+            old_msg("a1", "assistant", "final answer"),
+        ],
+        deletedAt="2026-07-30T12:00:00Z",
+    )
+    t3 = FakeT3Client({"t1": proj})
+    slack = FakeSlack()
+
+    t3_mirror._sweep(t3, slack, mirror, owner="dan")
+
+    assert slack.calls == []
+    assert "t1" not in mirror.threads()
+
+
+def test_null_deleted_at_keeps_thread(tmp_path):
+    mirror = make_mirror(tmp_path)
+    t3 = FakeT3Client({"t1": projection(deletedAt=None)})
+    slack = FakeSlack()
+
+    t3_mirror._sweep(t3, slack, mirror, owner="dan")
+
+    assert "t1" in mirror.threads()
+
+
 def test_user_message_gets_said_to_agent_prefix(tmp_path):
     mirror = make_mirror(tmp_path)
-    snapshot = {
-        "thread": {
-            "latestTurn": {"state": "completed", "assistantMessageId": "a1"},
-            "messages": [
-                old_msg("u1", "user", "what's the weather"),
-                old_msg("a1", "assistant", "sunny"),
-            ],
-        }
-    }
-    t3 = FakeT3Client({"t1": snapshot})
+    proj = projection(
+        runs=[run()],
+        messages=[
+            old_msg("u1", "user", "what's the weather", run_id=None),
+            old_msg("a1", "assistant", "sunny"),
+        ],
+    )
+    t3 = FakeT3Client({"t1": proj})
     slack = FakeSlack()
 
     t3_mirror._sweep(t3, slack, mirror, owner="dan")
@@ -130,17 +246,28 @@ def test_user_message_gets_said_to_agent_prefix(tmp_path):
     assert user_call["text"] == "_dan said to the agent:_ what's the weather"
 
 
+def test_user_message_posts_without_any_completed_run(tmp_path):
+    mirror = make_mirror(tmp_path)
+    proj = projection(
+        runs=[run(status="running")],
+        messages=[old_msg("u1", "user", "do the thing", run_id=None)],
+    )
+    t3 = FakeT3Client({"t1": proj})
+    slack = FakeSlack()
+
+    t3_mirror._sweep(t3, slack, mirror, owner="dan")
+
+    assert [c["text"] for c in slack.calls] == ["_dan said to the agent:_ do the thing"]
+    assert mirror.is_posted("t1", "u1") is True
+
+
 def test_grace_period_skips_fresh_message_and_does_not_ledger(tmp_path):
     mirror = make_mirror(tmp_path)
-    snapshot = {
-        "thread": {
-            "latestTurn": {"state": "completed", "assistantMessageId": "a1"},
-            "messages": [
-                old_msg("a1", "assistant", "brand new", age=0.1),
-            ],
-        }
-    }
-    t3 = FakeT3Client({"t1": snapshot})
+    proj = projection(
+        runs=[run()],
+        messages=[old_msg("a1", "assistant", "brand new", age=0.1)],
+    )
+    t3 = FakeT3Client({"t1": proj})
     slack = FakeSlack()
 
     t3_mirror._sweep(t3, slack, mirror, owner="dan")
@@ -152,15 +279,11 @@ def test_grace_period_skips_fresh_message_and_does_not_ledger(tmp_path):
 def test_message_older_than_grace_secs_posts(tmp_path, monkeypatch):
     monkeypatch.setattr(t3_mirror, "_GRACE_SECS", 5.0)
     mirror = make_mirror(tmp_path)
-    snapshot = {
-        "thread": {
-            "latestTurn": {"state": "completed", "assistantMessageId": "a1"},
-            "messages": [
-                old_msg("a1", "assistant", "aged out of the grace window", age=6.0),
-            ],
-        }
-    }
-    t3 = FakeT3Client({"t1": snapshot})
+    proj = projection(
+        runs=[run()],
+        messages=[old_msg("a1", "assistant", "aged out of the grace window", age=6.0)],
+    )
+    t3 = FakeT3Client({"t1": proj})
     slack = FakeSlack()
 
     t3_mirror._sweep(t3, slack, mirror, owner="dan")
@@ -173,15 +296,11 @@ def test_message_older_than_grace_secs_posts(tmp_path, monkeypatch):
 def test_already_posted_id_is_skipped(tmp_path):
     mirror = make_mirror(tmp_path)
     mirror.mark_posted("t1", ["a1"])
-    snapshot = {
-        "thread": {
-            "latestTurn": {"state": "completed", "assistantMessageId": "a1"},
-            "messages": [
-                old_msg("a1", "assistant", "already posted before"),
-            ],
-        }
-    }
-    t3 = FakeT3Client({"t1": snapshot})
+    proj = projection(
+        runs=[run()],
+        messages=[old_msg("a1", "assistant", "already posted before")],
+    )
+    t3 = FakeT3Client({"t1": proj})
     slack = FakeSlack()
 
     t3_mirror._sweep(t3, slack, mirror, owner="dan")
@@ -191,54 +310,66 @@ def test_already_posted_id_is_skipped(tmp_path):
 
 def test_empty_text_non_streaming_message_skipped_and_unledgered(tmp_path):
     mirror = make_mirror(tmp_path)
-    snapshot = {
-        "thread": {
-            "latestTurn": {"state": "completed", "assistantMessageId": "a1"},
-            "messages": [
-                old_msg("a1", "assistant", "   "),
-            ],
-        }
-    }
-    t3 = FakeT3Client({"t1": snapshot})
+    proj = projection(
+        runs=[run()],
+        messages=[old_msg("a1", "assistant", "   ")],
+    )
+    t3 = FakeT3Client({"t1": proj})
     slack = FakeSlack()
 
     t3_mirror._sweep(t3, slack, mirror, owner="dan")
 
     assert slack.calls == []
     assert mirror.is_posted("t1", "a1") is False
+
+
+def test_empty_user_message_skipped_and_unledgered(tmp_path):
+    mirror = make_mirror(tmp_path)
+    proj = projection(messages=[old_msg("u1", "user", "", run_id=None)])
+    t3 = FakeT3Client({"t1": proj})
+    slack = FakeSlack()
+
+    t3_mirror._sweep(t3, slack, mirror, owner="dan")
+
+    assert slack.calls == []
+    assert mirror.is_posted("t1", "u1") is False
 
 
 def test_streaming_message_skipped(tmp_path):
     mirror = make_mirror(tmp_path)
-    snapshot = {
-        "thread": {
-            "latestTurn": {"state": "running", "assistantMessageId": "a1"},
-            "messages": [
-                old_msg("a1", "assistant", "typing...", streaming=True),
-            ],
-        }
-    }
-    t3 = FakeT3Client({"t1": snapshot})
+    proj = projection(
+        runs=[run(status="running")],
+        messages=[old_msg("a1", "assistant", "typing...", streaming=True)],
+    )
+    t3 = FakeT3Client({"t1": proj})
     slack = FakeSlack()
 
     t3_mirror._sweep(t3, slack, mirror, owner="dan")
 
     assert slack.calls == []
     assert mirror.is_posted("t1", "a1") is False
+
+
+def test_streaming_user_message_skipped(tmp_path):
+    mirror = make_mirror(tmp_path)
+    proj = projection(messages=[old_msg("u1", "user", "typing...", streaming=True, run_id=None)])
+    t3 = FakeT3Client({"t1": proj})
+    slack = FakeSlack()
+
+    t3_mirror._sweep(t3, slack, mirror, owner="dan")
+
+    assert slack.calls == []
+    assert mirror.is_posted("t1", "u1") is False
 
 
 def test_long_message_chunked_into_multiple_posts_in_order(tmp_path):
     mirror = make_mirror(tmp_path)
     long_text = "".join(f"{i % 10}" for i in range(9000))  # 9000 chars, no whitespace to strip
-    snapshot = {
-        "thread": {
-            "latestTurn": {"state": "completed", "assistantMessageId": "a1"},
-            "messages": [
-                old_msg("a1", "assistant", long_text),
-            ],
-        }
-    }
-    t3 = FakeT3Client({"t1": snapshot})
+    proj = projection(
+        runs=[run()],
+        messages=[old_msg("a1", "assistant", long_text)],
+    )
+    t3 = FakeT3Client({"t1": proj})
     slack = FakeSlack()
 
     t3_mirror._sweep(t3, slack, mirror, owner="dan")
@@ -275,15 +406,11 @@ def test_other_t3_error_keeps_thread_registered(tmp_path):
 def test_outbound_scrub_redacts_secret_shape_in_assistant_text(tmp_path):
     mirror = make_mirror(tmp_path)
     fake_aws_key = "AKIAABCDEFGHIJKLMNOP"  # matches AKIA[0-9A-Z]{16}
-    snapshot = {
-        "thread": {
-            "latestTurn": {"state": "completed", "assistantMessageId": "a1"},
-            "messages": [
-                old_msg("a1", "assistant", f"here is a key: {fake_aws_key}"),
-            ],
-        }
-    }
-    t3 = FakeT3Client({"t1": snapshot})
+    proj = projection(
+        runs=[run()],
+        messages=[old_msg("a1", "assistant", f"here is a key: {fake_aws_key}")],
+    )
+    t3 = FakeT3Client({"t1": proj})
     slack = FakeSlack()
 
     t3_mirror._sweep(t3, slack, mirror, owner="dan")
@@ -295,15 +422,11 @@ def test_outbound_scrub_redacts_secret_shape_in_assistant_text(tmp_path):
 
 def test_slack_post_exception_does_not_raise_out_of_sweep(tmp_path):
     mirror = make_mirror(tmp_path)
-    snapshot = {
-        "thread": {
-            "latestTurn": {"state": "completed", "assistantMessageId": "a1"},
-            "messages": [
-                old_msg("a1", "assistant", "this post will explode"),
-            ],
-        }
-    }
-    t3 = FakeT3Client({"t1": snapshot})
+    proj = projection(
+        runs=[run()],
+        messages=[old_msg("a1", "assistant", "this post will explode")],
+    )
+    t3 = FakeT3Client({"t1": proj})
     slack = FakeSlack(fail=True)
 
     t3_mirror._sweep(t3, slack, mirror, owner="dan")  # must not raise
@@ -312,20 +435,22 @@ def test_slack_post_exception_does_not_raise_out_of_sweep(tmp_path):
     assert mirror.is_posted("t1", "a1") is True
 
 
-def _settled_snapshot(*, settled_override="settled", settled_at="2026-07-30T12:00:00Z",
-                      messages=None):
-    thread = {
-        "settledOverride": settled_override,
-        "settledAt": settled_at,
-        "latestTurn": {"state": "completed", "assistantMessageId": "a1"},
-        "messages": messages if messages is not None else [],
-    }
-    return {"thread": thread}
+def _settled_projection(*, settled_override="settled", settled_at="fresh", messages=None):
+    # "fresh" = settled a minute ago, inside the notice's max-age window.
+    if settled_at == "fresh":
+        settled_at = iso_now_minus(60)
+    return projection(
+        runs=[run()],
+        messages=messages,
+        settledOverride=settled_override,
+        settledAt=settled_at,
+    )
 
 
 def test_settled_override_posts_notice_with_owner_name(tmp_path):
     mirror = make_mirror(tmp_path)
-    t3 = FakeT3Client({"t1": _settled_snapshot()})
+    settled_at = iso_now_minus(60)
+    t3 = FakeT3Client({"t1": _settled_projection(settled_at=settled_at)})
     slack = FakeSlack()
 
     t3_mirror._sweep(t3, slack, mirror, owner="Dan")
@@ -335,13 +460,54 @@ def test_settled_override_posts_notice_with_owner_name(tmp_path):
     assert "settled this chat" in text
     assert "simply reply" in text
     assert "Dan" in text
-    assert mirror.settled_notice("t1") == "2026-07-30T12:00:00Z"
+    assert mirror.settled_notice("t1") == settled_at
+
+
+def test_fresh_settle_posted_when_settled_at_is_now(tmp_path):
+    mirror = make_mirror(tmp_path)
+    t3 = FakeT3Client({"t1": _settled_projection(settled_at=iso_now_minus(0))})
+    slack = FakeSlack()
+
+    t3_mirror._sweep(t3, slack, mirror, owner="Dan")
+
+    assert len(slack.calls) == 1
+    assert "settled this chat" in slack.calls[0]["text"]
+
+
+def test_stale_settle_recorded_silently(tmp_path):
+    """A settle from long ago (e.g. surfaced by the v1 -> v2 history import)
+    is recorded so it never re-announces, but not posted."""
+    mirror = make_mirror(tmp_path)
+    stale = "2026-07-30T12:00:00Z"
+    t3 = FakeT3Client({"t1": _settled_projection(settled_at=stale)})
+    slack = FakeSlack()
+
+    t3_mirror._sweep(t3, slack, mirror, owner="Dan")
+    t3_mirror._sweep(t3, slack, mirror, owner="Dan")
+
+    assert slack.calls == []
+    assert mirror.settled_notice("t1") == stale
+
+
+def test_settle_notice_age_boundary(tmp_path):
+    mirror_old = make_mirror(tmp_path / "old")
+    t3 = FakeT3Client({"t1": _settled_projection(
+        settled_at=iso_now_minus(t3_mirror._SETTLE_NOTICE_MAX_AGE_SECS + 60))})
+    slack_old = FakeSlack()
+    t3_mirror._sweep(t3, slack_old, mirror_old, owner="Dan")
+    assert slack_old.calls == []
+
+    mirror_new = make_mirror(tmp_path / "new")
+    t3 = FakeT3Client({"t1": _settled_projection(
+        settled_at=iso_now_minus(t3_mirror._SETTLE_NOTICE_MAX_AGE_SECS - 60))})
+    slack_new = FakeSlack()
+    t3_mirror._sweep(t3, slack_new, mirror_new, owner="Dan")
+    assert len(slack_new.calls) == 1
 
 
 def test_settled_notice_is_idempotent_across_sweeps(tmp_path):
     mirror = make_mirror(tmp_path)
-    snap = _settled_snapshot()
-    t3 = FakeT3Client({"t1": snap})
+    t3 = FakeT3Client({"t1": _settled_projection()})
     slack = FakeSlack()
 
     t3_mirror._sweep(t3, slack, mirror, owner="Dan")
@@ -352,26 +518,28 @@ def test_settled_notice_is_idempotent_across_sweeps(tmp_path):
 
 def test_unsettle_then_resettle_with_new_settled_at_announces_again(tmp_path):
     mirror = make_mirror(tmp_path)
-    t3 = FakeT3Client({"t1": _settled_snapshot(settled_at="2026-07-30T12:00:00Z")})
+    first = iso_now_minus(120)
+    second = iso_now_minus(30)
+    t3 = FakeT3Client({"t1": _settled_projection(settled_at=first)})
     slack = FakeSlack()
 
     t3_mirror._sweep(t3, slack, mirror, owner="Dan")
     assert len(slack.calls) == 1
 
-    t3.snapshots["t1"] = _settled_snapshot(settled_override=None, settled_at=None)
+    t3.projections["t1"] = _settled_projection(settled_override=None, settled_at=None)
     t3_mirror._sweep(t3, slack, mirror, owner="Dan")
     assert len(slack.calls) == 1
     assert mirror.settled_notice("t1") is None
 
-    t3.snapshots["t1"] = _settled_snapshot(settled_at="2026-07-30T13:00:00Z")
+    t3.projections["t1"] = _settled_projection(settled_at=second)
     t3_mirror._sweep(t3, slack, mirror, owner="Dan")
     assert len(slack.calls) == 2
-    assert mirror.settled_notice("t1") == "2026-07-30T13:00:00Z"
+    assert mirror.settled_notice("t1") == second
 
 
 def test_settled_override_active_never_announces(tmp_path):
     mirror = make_mirror(tmp_path)
-    t3 = FakeT3Client({"t1": _settled_snapshot(settled_override="active")})
+    t3 = FakeT3Client({"t1": _settled_projection(settled_override="active")})
     slack = FakeSlack()
 
     t3_mirror._sweep(t3, slack, mirror, owner="Dan")
@@ -382,8 +550,8 @@ def test_settled_override_active_never_announces(tmp_path):
 
 def test_settle_notice_lands_after_assistant_message_on_mapped_thread(tmp_path):
     mirror = make_mirror(tmp_path, channel="Cmap", thread_ts="2222.3333")
-    snap = _settled_snapshot(messages=[old_msg("a1", "assistant", "final answer")])
-    t3 = FakeT3Client({"t1": snap})
+    proj = _settled_projection(messages=[old_msg("a1", "assistant", "final answer")])
+    t3 = FakeT3Client({"t1": proj})
     slack = FakeSlack()
 
     t3_mirror._sweep(t3, slack, mirror, owner="Dan")
@@ -397,9 +565,9 @@ def test_settle_notice_lands_after_assistant_message_on_mapped_thread(tmp_path):
 
 
 def test_settled_at_null_announces_once_not_every_sweep(tmp_path):
+    # A missing settledAt counts as age 0, so the notice posts.
     mirror = make_mirror(tmp_path)
-    snap = _settled_snapshot(settled_at=None)
-    t3 = FakeT3Client({"t1": snap})
+    t3 = FakeT3Client({"t1": _settled_projection(settled_at=None)})
     slack = FakeSlack()
 
     t3_mirror._sweep(t3, slack, mirror, owner="Dan")
@@ -414,12 +582,13 @@ def test_settled_at_appearing_late_does_not_reannounce(tmp_path):
     # T3 may write settledOverride a beat before settledAt; the record updates
     # silently because the thread never left the settled state.
     mirror = make_mirror(tmp_path)
-    t3 = FakeT3Client({"t1": _settled_snapshot(settled_at=None)})
+    t3 = FakeT3Client({"t1": _settled_projection(settled_at=None)})
     slack = FakeSlack()
 
     t3_mirror._sweep(t3, slack, mirror, owner="Dan")
-    t3.snapshots["t1"] = _settled_snapshot(settled_at="2026-07-30T12:00:00Z")
+    late = iso_now_minus(5)
+    t3.projections["t1"] = _settled_projection(settled_at=late)
     t3_mirror._sweep(t3, slack, mirror, owner="Dan")
 
     assert len(slack.calls) == 1
-    assert mirror.settled_notice("t1") == "2026-07-30T12:00:00Z"
+    assert mirror.settled_notice("t1") == late

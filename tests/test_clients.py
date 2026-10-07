@@ -14,10 +14,11 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
+from websockets.sync.server import serve as ws_serve
 
 from slackcc import paths, slackfiles
 from slackcc.pps import PPSClient
-from slackcc.t3 import T3Client, T3Error
+from slackcc.t3 import T3Client, T3Error, final_reply, reply_streaming
 
 
 # --------------------------------------------------------------------------
@@ -172,47 +173,132 @@ def test_judge_url_trailing_slash_is_stripped():
 # T3Client
 # --------------------------------------------------------------------------
 
-def test_dispatch_posts_with_bearer_header_and_body_passthrough():
-    def responder(method, path, headers, body):
-        assert method == "POST"
-        assert path == "/api/orchestration/dispatch"
-        assert headers["Authorization"] == "Bearer secret-token-123"
-        assert headers["Content-Type"] == "application/json"
-        sent = json.loads(body.decode())
-        assert sent == {"kind": "sendMessage", "threadId": "t1"}
-        return 200, json.dumps({"ok": True, "echo": sent}).encode()
+class _WsServer:
+    """Threaded local WebSocket server speaking just enough Effect RPC.
 
-    with _LocalServer(responder) as srv:
-        client = T3Client(srv.url, token="secret-token-123")
-        result = client.dispatch({"kind": "sendMessage", "threadId": "t1"})
-        assert result == {"ok": True, "echo": {"kind": "sendMessage", "threadId": "t1"}}
+    `respond(request_dict) -> list[dict]` returns the frames to send back for
+    each received request. `reject_status` makes the upgrade fail with that
+    HTTP status instead (e.g. 426 for a protocol mismatch)."""
+
+    def __init__(self, respond=None, reject_status: int | None = None):
+        self.requests: list[dict] = []
+        self.paths: list[str] = []
+        self.headers: list[dict] = []
+        self.received: list[dict] = []
+        self._respond = respond or (lambda req: [])
+
+        def process_request(connection, request):
+            self.paths.append(request.path)
+            self.headers.append(dict(request.headers.raw_items()))
+            if reject_status is not None:
+                return connection.respond(reject_status, "nope\n")
+            return None
+
+        def handler(ws):
+            for raw in ws:
+                msg = json.loads(raw)
+                self.received.append(msg)
+                if msg.get("_tag") != "Request":
+                    continue
+                self.requests.append(msg)
+                for frame in self._respond(msg):
+                    ws.send(json.dumps(frame))
+
+        self.server = ws_serve(handler, "127.0.0.1", 0, process_request=process_request)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.server.socket.getsockname()[1]}"
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
 
 
-def test_thread_snapshot_uses_get_and_correct_path():
-    def responder(method, path, headers, body):
-        assert method == "GET"
-        assert path == "/api/orchestration/threads/claude-import-abc"
-        assert body == b""
-        return 200, json.dumps({"threadId": "claude-import-abc", "messages": []}).encode()
-
-    with _LocalServer(responder) as srv:
-        client = T3Client(srv.url, token="tok")
-        snapshot = client.thread_snapshot("claude-import-abc")
-        assert snapshot == {"threadId": "claude-import-abc", "messages": []}
+def _success(req, value):
+    return {"_tag": "Exit", "requestId": req["id"],
+            "exit": {"_tag": "Success", "value": value}}
 
 
-def test_non_2xx_raises_t3error_with_status_and_body_detail():
-    def responder(method, path, headers, body):
-        return 400, b"bad request: missing threadId"
+def test_dispatch_sends_rpc_request_with_bearer_and_protocol_version():
+    with _WsServer(lambda req: [_success(req, {"sequence": 7})]) as srv:
+        client = T3Client(srv.url, token="secret-token-123", timeout=5)
+        result = client.dispatch({"type": "thread.unsettle", "threadId": "t1"})
 
-    with _LocalServer(responder) as srv:
-        client = T3Client(srv.url, token="tok")
+    assert result == {"sequence": 7}
+    assert srv.paths == ["/ws?orchestrationProtocol=2"]
+    assert srv.headers[0]["Authorization"] == "Bearer secret-token-123"
+    (req,) = srv.requests
+    assert req["tag"] == "orchestration.dispatchCommand"
+    assert req["payload"] == {"type": "thread.unsettle", "threadId": "t1"}
+    assert req["headers"] == []
+
+
+def test_dispatch_answers_ping_and_ignores_other_request_ids():
+    def respond(req):
+        return [
+            {"_tag": "Ping"},
+            {"_tag": "Exit", "requestId": "unrelated",
+             "exit": {"_tag": "Success", "value": {"sequence": -1}}},
+            _success(req, {"sequence": 3}),
+        ]
+
+    with _WsServer(respond) as srv:
+        client = T3Client(srv.url, token="tok", timeout=5)
+        assert client.dispatch({"type": "x"}) == {"sequence": 3}
+    assert {"_tag": "Pong"} in srv.received
+
+
+def test_dispatch_typed_failure_raises_t3error_with_server_message():
+    def respond(req):
+        return [{"_tag": "Exit", "requestId": req["id"], "exit": {
+            "_tag": "Failure",
+            "cause": [{"_tag": "Fail", "error": {
+                "_tag": "OrchestrationV2DispatchCommandError",
+                "message": "No orchestration projection exists for thread t9."}}],
+        }}]
+
+    with _WsServer(respond) as srv:
+        client = T3Client(srv.url, token="tok", timeout=5)
         with pytest.raises(T3Error) as excinfo:
-            client.dispatch({"kind": "x"})
-        message = str(excinfo.value)
-        assert "400" in message
-        assert "bad request: missing threadId" in message
-        assert "/api/orchestration/dispatch" in message
+            client.dispatch({"type": "thread.unsettle", "threadId": "t9"})
+    message = str(excinfo.value)
+    assert "orchestration.dispatchCommand" in message
+    assert "No orchestration projection exists for thread t9." in message
+
+
+def test_dispatch_schema_defect_raises_t3error_with_defect_text():
+    def respond(req):
+        return [{"_tag": "Exit", "requestId": req["id"], "exit": {
+            "_tag": "Failure",
+            "cause": [{"_tag": "Die", "defect": "Expected { readonly type: ... }"}],
+        }}]
+
+    with _WsServer(respond) as srv:
+        client = T3Client(srv.url, token="tok", timeout=5)
+        with pytest.raises(T3Error) as excinfo:
+            client.dispatch({"type": "bogus"})
+    assert "Expected { readonly type: ... }" in str(excinfo.value)
+
+
+def test_protocol_mismatch_426_raises_t3error_naming_the_protocol():
+    with _WsServer(reject_status=426) as srv:
+        client = T3Client(srv.url, token="tok", timeout=5)
+        with pytest.raises(T3Error) as excinfo:
+            client.dispatch({"type": "x"})
+    assert "protocol v2" in str(excinfo.value)
+
+
+def test_rejected_upgrade_raises_t3error_with_status():
+    with _WsServer(reject_status=401) as srv:
+        client = T3Client(srv.url, token="bad", timeout=5)
+        with pytest.raises(T3Error) as excinfo:
+            client.dispatch({"type": "x"})
+    assert "401" in str(excinfo.value)
 
 
 def test_connection_refused_raises_t3error():
@@ -222,13 +308,75 @@ def test_connection_refused_raises_t3error():
     assert "unreachable" in str(excinfo.value)
 
 
-def test_dispatch_with_empty_response_body_returns_empty_dict():
+def test_thread_projection_gets_v2_path_with_protocol_header():
     def responder(method, path, headers, body):
-        return 200, b""
+        assert method == "GET"
+        assert path == "/api/orchestration/threads/slack-C1-2-3"
+        lowered = {k.lower(): v for k, v in headers.items()}
+        assert lowered["authorization"] == "Bearer tok"
+        assert lowered["x-t3-orchestration-protocol"] == "2"
+        return 200, json.dumps({"snapshotSequence": 9, "projection": {
+            "thread": {"id": "slack-C1-2-3"}, "runs": [], "messages": []}}).encode()
 
     with _LocalServer(responder) as srv:
         client = T3Client(srv.url, token="tok")
-        assert client.dispatch({"kind": "x"}) == {}
+        projection = client.thread_projection("slack-C1-2-3")
+    assert projection == {"thread": {"id": "slack-C1-2-3"}, "runs": [], "messages": []}
+
+
+def test_thread_projection_not_found_raises_t3error_with_reason():
+    def responder(method, path, headers, body):
+        return 404, json.dumps({"_tag": "EnvironmentResourceNotFoundError",
+                                "code": "not_found", "reason": "thread_not_found"}).encode()
+
+    with _LocalServer(responder) as srv:
+        client = T3Client(srv.url, token="tok")
+        with pytest.raises(T3Error) as excinfo:
+            client.thread_projection("gone")
+    message = str(excinfo.value)
+    assert "404" in message
+    assert "thread_not_found" in message
+
+
+def test_upload_image_mints_url_posts_bytes_and_returns_attachment(monkeypatch):
+    def responder(method, path, headers, body):
+        return 204, None
+
+    with _LocalServer(responder) as srv:
+        client = T3Client(srv.url, token="tok")
+        rpc_calls = []
+
+        def fake_rpc(tag, payload):
+            rpc_calls.append((tag, payload))
+            return {"attachmentId": "pending-abc", "relativeUrl": "/api/attachments/upload/tok.sig",
+                    "expiresAt": 0}
+
+        monkeypatch.setattr(client, "_rpc", fake_rpc)
+        att = client.upload_image(name="shot.png", mime_type="image/png", data=b"png-bytes")
+
+    assert rpc_calls == [("attachments.createUploadUrl", {
+        "type": "image", "name": "shot.png", "mimeType": "image/png", "sizeBytes": 9})]
+    (post,) = srv.requests
+    assert post["method"] == "POST"
+    assert post["path"] == "/api/attachments/upload/tok.sig"
+    assert post["headers"]["Content-Type"] == "image/png"
+    assert post["body"] == b"png-bytes"
+    assert att == {"type": "image", "id": "pending-abc", "name": "shot.png",
+                   "mimeType": "image/png", "sizeBytes": 9}
+
+
+def test_final_reply_is_last_finished_assistant_message_of_the_run():
+    projection = {"messages": [
+        {"id": "u", "role": "user", "runId": "r1", "text": "hi", "streaming": False},
+        {"id": "a1", "role": "assistant", "runId": "r1", "text": "narration", "streaming": False},
+        {"id": "a2", "role": "assistant", "runId": "r1", "text": "answer", "streaming": False},
+        {"id": "a3", "role": "assistant", "runId": "r1", "text": "  ", "streaming": False},
+        {"id": "a4", "role": "assistant", "runId": "r9", "text": "partial", "streaming": True},
+        {"id": "b1", "role": "assistant", "runId": "r2", "text": "other run", "streaming": False},
+    ]}
+    assert final_reply(projection, "r1")["id"] == "a2"
+    assert final_reply(projection, "r2")["id"] == "b1"
+    assert final_reply(projection, "r3") is None
 
 
 # --------------------------------------------------------------------------
@@ -385,21 +533,13 @@ def test_download_files_drops_entries_with_no_url(tmp_path, monkeypatch):
     assert slackfiles.download_files([{"name": "a"}], tmp_path, "tok") == []
 
 
-def test_build_t3_attachment_encodes_supported_image_as_data_url(tmp_path):
-    import base64
-
+def test_build_t3_attachment_packages_supported_image_for_upload(tmp_path):
     p = tmp_path / "shot.png"
     p.write_bytes(b"fake-png-bytes")
 
     att = slackfiles.build_t3_attachment(p)
 
-    assert att == {
-        "type": "image",
-        "name": "shot.png",
-        "mimeType": "image/png",
-        "sizeBytes": len(b"fake-png-bytes"),
-        "dataUrl": f"data:image/png;base64,{base64.b64encode(b'fake-png-bytes').decode()}",
-    }
+    assert att == {"name": "shot.png", "mimeType": "image/png", "data": b"fake-png-bytes"}
 
 
 def test_build_t3_attachment_returns_none_for_unsupported_mime_type(tmp_path):
@@ -522,3 +662,15 @@ def test_parse_dotenv_ignores_comments_blank_lines_and_strips_quotes(tmp_path):
 
 def test_parse_dotenv_returns_empty_dict_for_missing_file(tmp_path):
     assert paths._parse_dotenv(tmp_path / "missing.env") == {}
+
+
+def test_final_reply_waits_while_any_segment_of_the_run_streams():
+    projection = {"messages": [
+        {"id": "a1", "role": "assistant", "runId": "r1", "text": "narration", "streaming": False},
+        {"id": "a2", "role": "assistant", "runId": "r1", "text": "the ans", "streaming": True},
+        {"id": "b1", "role": "assistant", "runId": "r2", "text": "other run", "streaming": False},
+    ]}
+    assert final_reply(projection, "r1") is None
+    assert reply_streaming(projection, "r1") is True
+    assert final_reply(projection, "r2")["id"] == "b1"
+    assert reply_streaming(projection, "r2") is False

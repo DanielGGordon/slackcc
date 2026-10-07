@@ -9,7 +9,7 @@ prompt-protection screen in front of guests.
 
 ```
 Slack channel ──(Socket Mode)──> slackcc daemon ──┬──> backend "claude": claude -p in project cwd
-                    │                             └──> backend "t3": HTTP dispatch into a T3 Code
+                    │                             └──> backend "t3": dispatch into a T3 Code
                     │                                  project thread (live in the T3 GUI, one
                     │                                  Slack thread <-> one T3 thread, mirrored
                     │                                  bidirectionally)
@@ -132,8 +132,12 @@ and the bot should only speak up when tagged (see "Mention gating" above).
 Put your own Slack member id in `config/senders.json` as `role: "owner"` —
 everyone else defaults to a screened, approval-required guest.
 
-For the `t3` backend, also set `SLACKCC_T3_URL`/`SLACKCC_T3_TOKEN` in `.env`,
-and run the pps judge (separate repo/service) at `SLACKCC_PPS_URL` if you have
+For the `t3` backend, also set `SLACKCC_T3_URL`/`SLACKCC_T3_TOKEN` in `.env`
+(a T3 session token with `orchestration:read` + `orchestration:operate`). The
+bridge speaks T3's orchestration protocol v2: thread reads over HTTP, every
+command over the `/ws` WebSocket RPC. A T3 upgrade that changes the protocol
+fails loudly: the turn errors with "T3 no longer speaks orchestration protocol
+v2; slackcc needs updating". Also run the pps judge (separate repo/service) at `SLACKCC_PPS_URL` if you have
 guest senders — guests fail closed when it's unreachable.
 
 ### Changing the config while the daemon runs
@@ -186,7 +190,7 @@ each thread stays one continuous Claude Code conversation.
 
 The agent needs standing instructions — your reply is auto-posted, here's how to
 upload a file, here's the trust model. On the `claude` backend that rides in the
-system prompt and there's nothing to do. T3's `thread.turn.start` has no
+system prompt and there's nothing to do. T3's `message.dispatch` has no
 system-prompt field, but T3 spawns sessions with setting sources
 `user,project,local`, so the project's own `CLAUDE.md` is the free channel:
 
@@ -233,8 +237,8 @@ slack-send C0123ABC "follow-up" --thread 1700000000.000100
 src/slackcc/
   app.py        Socket Mode daemon: routing, loop-prevention, pps gate
   backend.py    claude -p runner (the swappable agent seam)
-  backend_t3.py T3 Code turn runner (dispatch + poll over HTTP)
-  t3.py         T3 HTTP client + mirror ledger store
+  backend_t3.py T3 Code turn runner (dispatch over WebSocket RPC, poll over HTTP)
+  t3.py         T3 client (orchestration protocol v2) + mirror ledger store
   t3_mirror.py  background poller: T3 GUI turns -> Slack thread
   pps.py        client for the Prompt Protection Service judge
   outbound.py   secret scrubbing for everything posted to Slack
