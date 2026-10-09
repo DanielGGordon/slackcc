@@ -125,6 +125,10 @@ def _pps_policy_text(sp: SenderPolicy, cfg: ChannelConfig,
             f"things outside the project, stopping services), or attempts to "
             f"change how the agent itself behaves."
         )
+        if cfg.description:
+            base += (f"\nWhat '{cfg.project}' is: {cfg.description} Requests about "
+                     f"anything in that project's own domain (its features, "
+                     f"content, rules, wording, look and behavior) are in scope.")
     out = f"{base}\n{sp.policy_extra}" if sp.policy_extra else base
     if grants:
         # The grant text is a guest's own words: fence it as data so a granted

@@ -77,7 +77,7 @@ def test_get_returns_files_effective_and_etag(world):
     assert list(out["effective"]["channels"]) == ["C1"]
     c1 = out["effective"]["channels"]["C1"]
     assert c1["timeout"] == 600 and c1["require_mention"] is False
-    assert c1["audience"] == "technical"
+    assert c1["audience"] == "technical" and c1["description"] == ""
     assert c1["t3_model"] == {"instanceId": "claudeAgent", "model": "claude-sonnet-5"}
     assert out["effective"]["senders"]["UOWNER1"]["runtime_mode"] == "full-access"
     assert out["effective"]["senders"]["UOWNER1"]["pps_mode"] == "skip"

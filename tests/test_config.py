@@ -211,6 +211,28 @@ def test_load_channels_rejects_a_bad_audience(tmp_path, bad):
         load_channels(config_path)
 
 
+def test_load_channels_description(tmp_path):
+    (tmp_path / "p").mkdir()
+    config_path = tmp_path / "channels.json"
+    _write_json(config_path, {"channels": {
+        "C1": {"project": "a", "cwd": str(tmp_path / "p"), "description": "A board game."},
+        "C2": {"project": "b", "cwd": str(tmp_path / "p")},
+    }})
+    channels = load_channels(config_path)
+    assert channels["C1"].description == "A board game."
+    assert channels["C2"].description == ""
+
+
+@pytest.mark.parametrize("bad", [3, None, ["a board game"]])
+def test_load_channels_rejects_a_bad_description(tmp_path, bad):
+    (tmp_path / "p").mkdir()
+    config_path = tmp_path / "channels.json"
+    _write_json(config_path, {"channels": {
+        "C1": {"project": "a", "cwd": str(tmp_path / "p"), "description": bad}}})
+    with pytest.raises(ValueError, match="description"):
+        load_channels(config_path)
+
+
 # ---------------------------------------------------------------------------
 # load_senders
 # ---------------------------------------------------------------------------
