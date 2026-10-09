@@ -50,6 +50,11 @@ class ChannelConfig:
     # and only that block reaches Slack (customer.py). A property of the
     # channel, not the sender: even a turn Dan triggers from Slack is customer-voiced.
     audience: str = "technical"
+    # What the project IS, in a sentence or three, for the pps judge. A guest's
+    # message is screened against "the project '<name>' ONLY"; with just a name
+    # the small judge model rules in-domain requests out of scope (a board
+    # game's "Mazel cards" or "fabric tokens"). Not shown to the agent.
+    description: str = ""
 
     def validate(self) -> None:
         if not Path(self.cwd).is_dir():
@@ -249,6 +254,7 @@ def parse_channels(raw: dict) -> dict[str, ChannelConfig]:
             t3_model=dict(t3_model),
             require_mention=bool(spec.get("require_mention", False)),
             audience=_str_field(spec, "audience", where, default="technical"),
+            description=_str_field(spec, "description", where, default="", empty_ok=True),
         )
         cfg.validate()
         out[channel_id] = cfg
@@ -336,7 +342,8 @@ def effective(settings: Settings) -> dict:
                 "t3_project_id": c.t3_project_id, "t3_model": c.t3_model,
                 "permission_mode": c.permission_mode, "timeout": c.timeout,
                 "approval_timeout": c.approval_timeout,
-                "require_mention": c.require_mention, "audience": c.audience}
+                "require_mention": c.require_mention, "audience": c.audience,
+                "description": c.description}
 
     def sp(p: SenderPolicy) -> dict:
         return {"name": p.name, "role": p.role, "runtime_mode": p.runtime_mode,

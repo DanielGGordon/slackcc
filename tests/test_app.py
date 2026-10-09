@@ -464,6 +464,29 @@ def test_pps_policy_text_appends_policy_extra():
     assert "Never touch" not in text_no_extra
 
 
+def test_pps_policy_text_guest_includes_channel_description():
+    # Without a description the judge ruled a board game's own vocabulary
+    # ("Mazel card", "fabric tokens") out of scope for project 'jewtopia'.
+    cfg = ChannelConfig(channel_id="C1", project="jewtopia", cwd=".",
+                        description="A Monopoly-style board game web app.")
+    sp = SenderPolicy(user_id="U2", name="Alice", role="guest",
+                      policy_extra="Never touch the prod database.")
+    text = _pps_policy_text(sp, cfg)
+    assert "What 'jewtopia' is: A Monopoly-style board game web app." in text
+    assert "in scope" in text
+    assert text.endswith("Never touch the prod database.")  # extra still last
+
+    bare = _pps_policy_text(sp, ChannelConfig(channel_id="C1", project="jewtopia", cwd="."))
+    assert "What 'jewtopia' is" not in bare
+
+
+def test_pps_policy_text_owner_ignores_channel_description():
+    cfg = ChannelConfig(channel_id="C1", project="proj-x", cwd=".",
+                        description="A board game.")
+    sp = SenderPolicy(user_id="U1", name="Dan", role="owner")
+    assert "board game" not in _pps_policy_text(sp, cfg)
+
+
 def test_pps_policy_text_appends_owner_grants_as_context():
     cfg = ChannelConfig(channel_id="C1", project="proj-x", cwd=".")
     sp = SenderPolicy(user_id="U2", name="Alice", role="guest",

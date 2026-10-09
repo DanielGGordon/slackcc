@@ -183,6 +183,13 @@ Add `"require_mention": true` if the channel is also used for unrelated chat
 and the bot should only speak up when tagged (see "Mention gating" above).
 Set `"audience": "customer"` on channels read by non-coders (see "Customer
 channels" above); leave it off for technical channels.
+Give every channel guests post in a `"description"`: two or three sentences
+on what the project *is* (e.g. "A Monopoly-style board game web app ... Mazel
+cards ... Mitzvah points"). pps judges a guest's message against "the project
+'<name>' ONLY", and with just a name its small judge model rules the project's
+own vocabulary out of scope. The description only goes to the judge, never to
+the agent. If a guest's ordinary requests keep getting declined as
+`out_of_scope`, the description is what to improve.
 Put your own Slack member id in `config/senders.json` as `role: "owner"` —
 everyone else defaults to a screened, approval-required guest.
 
