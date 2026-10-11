@@ -433,10 +433,6 @@ def build_app(config: Settings | LiveSettings) -> App:
                 # system-prompt field, so persona and protocol both come from the
                 # project's CLAUDE.md (T3 spawns with setting sources
                 # user,project,local) and only the routing header rides along.
-                #
-                # If `slackcc init-project` hasn't been run there, fall back to
-                # paying for the protocol inline on the first turn of the thread --
-                # the agent gets it either way, just less cheaply.
                 thread_id = resume or f"slack-{channel_id}-{thread_ts.replace('.', '-')}"
 
                 # Send any downloaded images as real T3 attachments (run_turn
@@ -456,12 +452,17 @@ def build_app(config: Settings | LiveSettings) -> App:
                                     len(attachments) - _MAX_T3_ATTACHMENTS, _MAX_T3_ATTACHMENTS)
                     attachments = attachments[:_MAX_T3_ATTACHMENTS]
 
+                # Before a thread's first turn, bring that CLAUDE.md up to date
+                # ourselves (a new channel, or a protocol change since the last
+                # `slackcc init-project`). Only if it can't be written do we fall
+                # back to carrying the protocol on the first turn, as a hidden
+                # comment so the GUI still shows the customer's message first.
                 protocol = None
-                if resume is None and not bridgedoc.is_current(cfg.cwd):
-                    log.warning("bridge protocol missing or out of date in %s/CLAUDE.md; "
-                                "injecting inline. Run: slackcc init-project %s",
-                                cfg.cwd, cfg.cwd)
-                    protocol = bridgedoc.render()
+                if resume is None and not bridgedoc.ensure_current(cfg.cwd):
+                    log.warning("could not write the bridge protocol to %s/CLAUDE.md; "
+                                "injecting inline. Fix permissions, or run: "
+                                "slackcc init-project %s", cfg.cwd, cfg.cwd)
+                    protocol = bridgedoc.hidden(bridgedoc.render())
                 mirror.register(thread_id, channel_id, thread_ts)
 
                 # The user was told "to unsettle this chat, simply reply" — honour it. The

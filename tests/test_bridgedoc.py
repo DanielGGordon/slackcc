@@ -215,3 +215,27 @@ def test_packaged_doc_teaches_the_exact_customer_block_marker():
 def test_packaged_doc_does_not_lean_on_the_operators_dotfiles():
     rendered = bridgedoc.render()
     assert "dotfiles" not in rendered and "~/.claude" not in rendered
+
+
+def test_ensure_current_installs_missing_and_refreshes_stale(tmp_path):
+    assert bridgedoc.ensure_current(tmp_path) is True
+    assert bridgedoc.is_current(tmp_path) is True
+    path = tmp_path / "CLAUDE.md"
+    path.write_text(
+        f"# Head\n\n{bridgedoc.MARK_BEGIN}\nOLD PROTOCOL\n{bridgedoc.MARK_END}\n"
+    )
+    assert bridgedoc.ensure_current(tmp_path) is True
+    assert bridgedoc.is_current(tmp_path) is True
+    assert path.read_text().startswith("# Head")
+
+
+def test_ensure_current_is_false_when_the_project_cannot_be_written(tmp_path):
+    assert bridgedoc.ensure_current(tmp_path / "nope") is False
+
+
+def test_hidden_is_one_comment_the_inline_protocol_cannot_close_early():
+    hidden = bridgedoc.hidden(bridgedoc.render())
+    assert hidden.startswith("<!--") and hidden.endswith("-->")
+    # The protocol quotes comments; only our own closing delimiter may remain.
+    assert hidden.count("-->") == 1
+    assert hidden.count("<!--") == 1

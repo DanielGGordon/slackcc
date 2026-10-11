@@ -129,9 +129,11 @@ Slack channel ──(Socket Mode)──> slackcc daemon ──┬──> backend
   reply, upload files, and post extra messages ships with the package
   (`src/slackcc/data/slack-bridge.md`) and reaches the agent through its system
   prompt (`claude` backend) or the project's `CLAUDE.md` (`t3` backend — see
-  step 4). A project whose `CLAUDE.md` copy is missing *or out of date* gets the
-  protocol injected inline on each thread's first turn (with a log warning)
-  until `slackcc init-project` is re-run.
+  step 4). Before a thread's first turn the daemon
+  rewrites a missing *or out-of-date* `CLAUDE.md` section itself (the same thing
+  `slackcc init-project` does), so a new channel or a protocol change needs no
+  manual step. Only if the file can't be written is the protocol injected inline
+  on that first turn — as a hidden HTML comment, with a log warning.
 
 ## 1. Create the Slack app (one-time)
 
@@ -265,9 +267,12 @@ This writes a marker-delimited `## Slack Bridge` section into that project's
 untouched). **Commit it** — T3 threads can run in a git worktree, which only
 sees committed files.
 
-Skipping this is not fatal: the daemon detects the missing section and injects
-the protocol inline on the first turn of each thread instead, logging a warning.
-That costs tokens once per thread rather than never.
+You rarely need to run this by hand: before the first turn of each thread the
+daemon checks the project's section and rewrites it if it is missing or stale, so
+new channels and protocol upgrades self-heal. (It leaves the edit uncommitted —
+bridged threads run in the project root, not a worktree, so they see it.) If the
+file can't be written the daemon injects the protocol inline on that first turn,
+wrapped in an HTML comment so the T3 GUI hides it, and logs a warning.
 
 ## Testing
 
