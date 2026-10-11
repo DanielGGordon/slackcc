@@ -9,8 +9,10 @@ data here and reaches the agent one of two ways, depending on backend:
 - `t3` backend: `message.dispatch` has no system-prompt field, and T3 spawns
   its sessions with setting sources `user,project,local` -- so the project's own
   `CLAUDE.md` is the free channel. `slackcc init-project` writes this document
-  into a marker-delimited section there. Until that's done, `app.py` falls back
-  to injecting it inline on the first turn of each thread.
+  into a marker-delimited section there. The daemon keeps that section current
+  itself (`ensure_current`, run before the first turn of every thread); only if
+  the file can't be written does `app.py` fall back to injecting the protocol
+  inline on the first turn, hidden from the T3 GUI (`hidden`).
 
 Nothing here depends on the operator's personal dotfiles: the document lives in
 the package, and the copy in a project's CLAUDE.md is written from it.
@@ -138,3 +140,33 @@ def install(project_dir: Path | str) -> str:
         return "unchanged"
     path.write_text(updated)
     return "updated"
+
+
+def ensure_current(project_dir: Path | str) -> bool:
+    """Make the project's CLAUDE.md carry the current protocol; True if it does.
+
+    Called by the daemon before the first turn of a thread, so a protocol
+    change, a new channel, or a project nobody ran `slackcc init-project` in
+    heals itself instead of costing every new thread an inline copy. Returns
+    False when the file can't be written (read-only, no such directory), in
+    which case the caller falls back to injecting the protocol inline."""
+    if is_current(project_dir):
+        return True
+    try:
+        install(project_dir)
+    except OSError:
+        return False
+    return is_current(project_dir)
+
+
+def hidden(protocol: str) -> str:
+    """The protocol as one HTML comment, for the inline fallback.
+
+    The T3 GUI drops HTML comments from user messages (see app.bridge_header)
+    while the model still reads them, so a project that can't carry the
+    protocol in CLAUDE.md doesn't bury the customer's message under 8 KB of
+    instructions. The protocol quotes comments itself, so those delimiters are
+    entity-escaped to keep the first `-->` from closing this one early."""
+    body = protocol.replace("<!--", "&lt;!--").replace("-->", "--&gt;")
+    return (f"<!-- slackcc bridge protocol (HTML comment delimiters below are "
+            f"entity-escaped as &lt;!-- and --&gt;):\n{body}\n-->")

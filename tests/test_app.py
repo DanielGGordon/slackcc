@@ -1144,20 +1144,21 @@ def test_handle_t3_thin_prompt_when_the_project_carries_the_protocol(make_env):
     assert call["title"] == "#sofer-ai: hi"  # no ids in the GUI title either
 
 
-def test_handle_t3_injects_protocol_inline_when_project_uninstalled(make_env):
+def test_handle_t3_installs_protocol_itself_when_project_uninstalled(make_env):
     env = make_env()
-    assert not bridgedoc.is_installed(env.settings.channel("Ct3").cwd)
+    cwd = env.settings.channel("Ct3").cwd
+    assert not bridgedoc.is_installed(cwd)
 
     call_handle(env, make_event(channel="Ct3", user="Uowner", text="hi", ts="90.9"))
 
-    # Fallback: the agent still gets the protocol, just not for free.
-    prompt = env.backend_t3_calls[0]["prompt"]
-    assert prompt == (
-        f'{bridge_header("Ct3", "90.9", "owner", "technical")}\n\n{bridgedoc.render()}\n\nDan from #sofer-ai: hi'
+    # Self-healing: the daemon wrote CLAUDE.md, so the turn stays thin.
+    assert bridgedoc.is_current(cwd)
+    assert env.backend_t3_calls[0]["prompt"] == (
+        f'{bridge_header("Ct3", "90.9", "owner", "technical")}\n\nDan from #sofer-ai: hi'
     )
 
 
-def test_handle_t3_injects_protocol_inline_when_project_copy_is_stale(make_env):
+def test_handle_t3_refreshes_a_stale_protocol_copy_itself(make_env):
     env = make_env()
     cwd = env.settings.channel("Ct3").cwd
     bridgedoc.install(cwd)
@@ -1168,8 +1169,24 @@ def test_handle_t3_injects_protocol_inline_when_project_copy_is_stale(make_env):
 
     call_handle(env, make_event(channel="Ct3", user="Uowner", text="hi", ts="90.95"))
 
-    # Stale is treated like missing: the current protocol rides inline.
-    assert bridgedoc.render() in env.backend_t3_calls[0]["prompt"]
+    assert bridgedoc.is_current(cwd)
+    assert bridgedoc.render() not in env.backend_t3_calls[0]["prompt"]
+
+
+def test_handle_t3_falls_back_to_a_hidden_inline_protocol_when_unwritable(make_env, monkeypatch):
+    env = make_env()
+    monkeypatch.setattr(bridgedoc, "install",
+                        lambda d: (_ for _ in ()).throw(PermissionError("read-only")))
+
+    call_handle(env, make_event(channel="Ct3", user="Uowner", text="hi", ts="90.96"))
+
+    prompt = env.backend_t3_calls[0]["prompt"]
+    # The agent still gets the protocol, but as one HTML comment the T3 GUI
+    # hides, so the customer's message is the first thing the owner sees.
+    assert prompt == (
+        f'{bridge_header("Ct3", "90.96", "owner", "technical")}\n\n'
+        f'{bridgedoc.hidden(bridgedoc.render())}\n\nDan from #sofer-ai: hi'
+    )
 
 
 def test_handle_t3_resume_never_pays_for_the_protocol(make_env):
