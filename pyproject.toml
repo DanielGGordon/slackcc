@@ -8,6 +8,11 @@ dependencies = [
     "slack-sdk>=3.27",
     "claude-agent-sdk>=0.2.110",
     "websockets>=13.0",  # T3 orchestration v2 commands are WebSocket RPC
+    # The shared secret scanner (outbound scrubbing). Pinned to a release tag of
+    # pps and installed as a copy into the venv -- NOT an editable link to
+    # ~/projects/pps, whose checkout agents switch branches in while this
+    # service is running. Bump the tag to pick up new patterns (README, "Secret scrubbing").
+    "pps @ git+https://github.com/DanielGGordon/Prompt-Protection-Service.git@secrets-v0.1.0",
 ]
 
 [project.scripts]
