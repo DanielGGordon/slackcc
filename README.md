@@ -116,7 +116,9 @@ Slack channel ──(Socket Mode)──> slackcc daemon ──┬──> backend
   the plain-reply and block rules key on the channel's audience, so a guest in
   a technical channel is still auto-shipped but gets technical replies.
 - **Outbound scrubbing:** every message posted to Slack is scanned and
-  secret-shaped strings (tokens, keys, JWTs) are redacted.
+  secret-shaped strings (tokens, keys, JWTs) are redacted. The scanner is
+  `pps.secrets`, shared with the software factory (see
+  [Secret scrubbing](#secret-scrubbing-the-pps-dependency)).
 - **Trust boundary:** pps is the screen, so a message that reaches the agent is
   trusted content and arrives as plain text. The residual case — a guest in
   `pps_mode: "log"`, where the judge watches but never blocks — still gets fenced
@@ -249,6 +251,23 @@ pip install -e .
 Now post a message in the configured channel — the bot replies in-thread, and
 each thread stays one continuous Claude Code conversation.
 
+### Secret scrubbing (the pps dependency)
+
+Outbound scrubbing uses `pps.secrets`, the one secret scanner shared with the
+software factory's gate, from the sibling [pps](https://github.com/DanielGGordon/Prompt-Protection-Service)
+repo. `pip install -e .` installs it into the venv as a **copy pinned to a pps
+release tag** (the `pps @ git+https://…@secrets-vX.Y.Z` line in `pyproject.toml`).
+It is deliberately not an editable link to `~/projects/pps`: agents switch
+branches in that checkout, and the running daemon must not change behaviour (or
+fail to import) when they do.
+
+To pick up new patterns or fixes: tag a pps release, bump the tag in
+`pyproject.toml`, then in the live venv
+`.venv/bin/pip install --force-reinstall --no-deps "pps @ git+https://github.com/DanielGGordon/Prompt-Protection-Service.git@<tag>"`
+and restart the service. Check with
+`.venv/bin/python -c "import pps.secrets"` before restarting: a missing pps is an
+import error at daemon start, not a silent loss of scrubbing.
+
 ## 4. Teach the project the bridge protocol (`t3` backend only)
 
 The agent needs standing instructions — your reply is auto-posted, here's how to
@@ -308,7 +327,7 @@ src/slackcc/
   t3_mirror.py  background poller: T3 GUI turns -> Slack thread
   customer.py   customer voice: block parser, leak gate, told-so-far ledger, owner alert
   pps.py        client for the Prompt Protection Service judge
-  outbound.py   secret scrubbing for everything posted to Slack
+  outbound.py   secret scrubbing for everything posted to Slack (wraps pps.secrets)
   config.py     env + channels.json + senders.json loading, per-sender policy,
                 the effective-config view, LiveSettings (the swappable config)
   config_api.py loopback GET/PUT /config + SIGHUP reload (no restart to change config)
