@@ -199,12 +199,54 @@ def _context_full(projection: dict, run_id: str) -> bool:
     return False
 
 
-def run_turn(**kwargs) -> TurnResult:
-    """One Slack turn, with a safety net for a full session: if the run fails
-    because the context window has no room left, compact the session once and
-    retry the same prompt. A failed compaction or a second failure is returned
-    as-is -- never a loop."""
+def _context_tokens(projection: dict) -> int | None:
+    """Tokens in the thread's live context: the active provider thread's
+    `contextUsage` (falling back to the newest provider thread reporting one)."""
+    threads = projection.get("providerThreads") or []
+    active = (projection.get("thread") or {}).get("activeProviderThreadId")
+    ordered = sorted(threads, key=lambda t: (t.get("id") == active, t.get("updatedAt") or ""),
+                     reverse=True)
+    for pt in ordered:
+        used = (pt.get("contextUsage") or {}).get("usedTokens")
+        if isinstance(used, int):
+            return used
+    return None
+
+
+def _compact(kwargs: dict) -> TurnResult:
+    """Send `/compact` into the thread and wait for it. Quiet: no progress
+    edits, and it never carries the user's images."""
+    return _run_once(**{**kwargs, "prompt": "/compact", "is_new": False, "images": None,
+                        "on_progress": None, "on_approval_wait": None})
+
+
+def run_turn(*, compact_first: bool = False, **kwargs) -> TurnResult:
+    """One Slack turn.
+
+    `compact_first`: the bridge's own context watch (`context_watch.py`) warned
+    this thread it was getting long, so compact it before running the message.
+    A failed compaction is logged and the message runs anyway.
+
+    Plus a safety net for a full session: if the run fails because the context
+    window has no room left, compact the session once and retry the same
+    prompt. A failed compaction or a second failure is returned as-is -- never
+    a loop."""
+    compacted = False
+    if compact_first and not kwargs.get("is_new"):
+        thread_id = kwargs["thread_id"]
+        log.info("t3 context watch: compacting %s before the next message", thread_id)
+        on_progress = kwargs.get("on_progress")
+        if on_progress is not None:
+            try:
+                on_progress(":broom: _the conversation is long -- tidying it up first_")
+            except Exception:  # noqa: BLE001 - progress must not kill the turn
+                log.warning("progress callback failed", exc_info=True)
+        pre = _compact(kwargs)
+        compacted = pre.ok
+        if not pre.ok:
+            log.error("pre-turn compact failed on %s: %s", thread_id, pre.error)
     result = _run_once(**kwargs)
+    result.compacted = compacted
     if not result.context_full:
         return result
     thread_id = kwargs["thread_id"]
@@ -215,12 +257,13 @@ def run_turn(**kwargs) -> TurnResult:
             on_progress(":broom: _the conversation is long -- tidying it up first_")
         except Exception:  # noqa: BLE001 - progress must not kill the turn
             log.warning("progress callback failed", exc_info=True)
-    compact = _run_once(**{**kwargs, "prompt": "/compact", "is_new": False, "images": None,
-                           "on_progress": None, "on_approval_wait": None})
+    compact = _compact(kwargs)
     if not compact.ok:
         log.error("auto-compact failed on %s: %s", thread_id, compact.error)
         return result
-    return _run_once(**{**kwargs, "is_new": False})
+    retried = _run_once(**{**kwargs, "is_new": False})
+    retried.compacted = True
+    return retried
 
 
 def _run_once(
@@ -386,7 +429,7 @@ def _run_once(
         if status == "completed":
             return TurnResult(ok=True, text=text, session_id=thread_id,
                               message_id=reply["id"] if reply is not None else None,
-                              private=private)
+                              private=private, context_tokens=_context_tokens(projection))
         return TurnResult(
             ok=False,
             text=text,

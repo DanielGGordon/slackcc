@@ -109,6 +109,9 @@ class Settings:
     # approval pings; the loopback t3_url is useless in a phone notification.
     t3_gui_url: str | None = None
     pps_url: str = "http://127.0.0.1:8642"
+    # t3 backend: context size (tokens) at which a thread is warned and then
+    # compacted on its next message (context_watch.py).
+    context_warn_tokens: int = 200_000
     senders: dict[str, SenderPolicy] = field(default_factory=dict)
     guest_defaults: SenderPolicy | None = None
     # Where senders came from; None only for Settings built by hand (tests).
@@ -377,6 +380,7 @@ def load_settings() -> Settings:
         t3_owner=os.environ.get("SLACKCC_T3_OWNER", "Dan"),
         t3_gui_url=os.environ.get("SLACKCC_T3_GUI_URL") or None,
         pps_url=os.environ.get("SLACKCC_PPS_URL", "http://127.0.0.1:8642"),
+        context_warn_tokens=int(os.environ.get("SLACKCC_CONTEXT_WARN_TOKENS", "200000")),
         senders=senders,
         guest_defaults=guest_defaults,
         senders_path=senders_path,
