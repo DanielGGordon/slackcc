@@ -63,6 +63,14 @@ Slack channel ──(Socket Mode)──> slackcc daemon ──┬──> backend
   are still judged, but the judge sees the granted request as fenced,
   data-only context, so plain follow-ups to it pass while unrelated asks are
   still declined. State: `.state/pps_overrides.json`.
+  The same question can be answered **off Slack**: each pending ask has a
+  stable `id` plus the sender, channel and a permalink to the held message,
+  served on the config API (`GET /overrides`, `POST /overrides/<id>/decide`,
+  below). Alfred polls it and puts an Approve / Disapprove / More info
+  notification on the owner's phone; an answer from there is posted in the
+  thread ("approved (from alfred)") and replayed exactly like a *yes*. Either
+  path consumes the question atomically, so the other finds nothing to answer,
+  and a stale id (the question was replaced or expired) is refused.
 - **Guest model (t3 backend):** non-owner conversations start on Sonnet 5.5
   (`claude-sonnet-5-5`); owners keep the channel's `t3_model`. Override with a
   `t3_model` object (`{"instanceId": …, "model": …}`) on a `senders.json`
@@ -223,9 +231,11 @@ The daemon reads both files at start and then **reloads without a restart**:
   |---|---|
   | `GET /config` | `{etag, channels, senders, senders_file, problems[], effective, loaded:{etag,at,source}, loaded_current}` — the two files as JSON, and the *effective* config the daemon runs with (every default applied; `effective` is the only place defaults live) |
   | `PUT /config` | `{if_match, channels?, senders?, dry_run?}` → validated by the same parser the daemon starts with, both files backed up to `.state/config-backups/` (last 20), written atomically, swapped into the running daemon. `dry_run: true` answers `{effective}` for the candidate and writes nothing. 409 `stale` when `if_match` isn't the current etag, 422 `invalid` with the loader's message, 422 `restart_required` for the first `t3` channel (the T3 client only starts at boot), 422 `senders_missing` when `senders.json` has gone but the daemon is running a sender policy |
+  | `GET /overrides` | `{ok, api, pending:[{id, channel, channel_name, thread_ts, message_ts, user, sender_name, text, files[], category, reason, asked_at, permalink}]}` — the open owner-override questions (pps-held guest messages), oldest first |
+  | `POST /overrides/<id>/decide` | `{approved: bool, via?}` → answers that question as the first owner, like a *yes*/*no* in its thread (`via`, default `alfred`, is named in the thread post). Answers `{ok, id, approved, ack}` at once; the thread post and the replayed turn run in the background. 404 `not_pending` (answered, replaced by a newer denial, or expired), 400 `invalid_request`, 503 `no_owner` |
   | `GET /healthz` | `{ok:true}`, no token |
 
-  Every `/config` request needs `Authorization: Bearer $SLACKCC_CONFIG_TOKEN`.
+  Every `/config` and `/overrides` request needs `Authorization: Bearer $SLACKCC_CONFIG_TOKEN`.
   Only the routing map and sender policy reload; tokens and URLs still need a
   restart. A turn already running finishes on the config it started with.
 

@@ -419,7 +419,8 @@ def build_app(config: Settings | LiveSettings) -> App:
                         finish(f":no_entry: Message declined by the safety screen "
                                f"({category}): {reason}")
                         _ask_owners(event, category, reason, channel_id, thread_ts,
-                                    say, logger)
+                                    say, logger, client=client,
+                                    sender_name=sender_name, channel_name=channel_name)
                         return
                     if verdict["verdict"] == "error":
                         # Fail closed for guests: no screen, no turn.
@@ -634,10 +635,16 @@ def build_app(config: Settings | LiveSettings) -> App:
             thread_lock.release()
 
     def _ask_owners(event: dict, category: str, reason: str, channel_id: str,
-                    thread_ts: str, say, logger) -> None:
+                    thread_ts: str, say, logger, *, client=None,
+                    sender_name: str = "", channel_name: str = "") -> None:
         """Post the in-thread "do you permit this?" question and remember the
         original event so a "yes" can replay it. No owners configured -> the
-        denial stands silently, as before."""
+        denial stands silently, as before.
+
+        The pending entry also carries what an out-of-Slack approver needs
+        (GET /overrides on the config API -- Alfred's phone notification): a
+        stable `id` to answer by, who sent it, where, and a permalink to the
+        held message."""
         owner_ids = live.current.owner_ids()
         if not owner_ids:
             return
@@ -665,8 +672,19 @@ def build_app(config: Settings | LiveSettings) -> App:
             logger.warning("could not post owner override ask; not recording pending",
                            exc_info=True)
             return
+        permalink = None
+        if client is not None and event.get("ts"):
+            try:
+                permalink = client.chat_getPermalink(
+                    channel=channel_id, message_ts=event["ts"]).get("permalink")
+            except Exception:  # noqa: BLE001 - a link is a nicety, not the question
+                logger.warning("could not get a permalink for the held message",
+                               exc_info=True)
         overrides.set_pending(channel_id, thread_ts, {
+            "id": uuid.uuid4().hex[:16],
             "event": stored, "category": category, "reason": reason,
+            "sender_name": sender_name, "channel_name": channel_name,
+            "permalink": permalink,
             "asked_at": time.time(),
         })
 
@@ -680,15 +698,25 @@ def build_app(config: Settings | LiveSettings) -> App:
             log.info("override answer by owner=%s thread=%s: nothing pending",
                      owner, thread_ts)
             return
+        _apply_override(pending, approved, owner, channel_id, thread_ts,
+                        say, client, logger)
+
+    def _apply_override(pending: dict, approved: bool, owner: str, channel_id: str,
+                        thread_ts: str, say, client, logger, *, via: str = "") -> None:
+        """Act on an owner's answer to an already-consumed pending question:
+        say so in the thread and, on a yes, replay the guest's message.
+        `via` names where the answer came from when it wasn't the thread."""
+        where = f" (from {via})" if via else ""
         if not approved:
-            say(text=":no_entry: Understood — that request stays declined.",
+            say(text=(f":no_entry: <@{owner}> declined{where} — that request stays declined."
+                      if via else ":no_entry: Understood — that request stays declined."),
                 thread_ts=thread_ts)
             return
         original = dict(pending.get("event") or {})
         guest = original.get("user", "unknown")
-        log.info("pps override granted by owner=%s for user=%s thread=%s",
-                 owner, guest, thread_ts)
-        say(text=scrub(f":white_check_mark: <@{owner}> approved — working on "
+        log.info("pps override granted by owner=%s for user=%s thread=%s via=%s",
+                 owner, guest, thread_ts, via or "slack")
+        say(text=scrub(f":white_check_mark: <@{owner}> approved{where} — working on "
                        f"<@{guest}>'s request now.")[0],
             thread_ts=thread_ts)
         # Replay the guest's own event (their user id, text, files) so
@@ -711,11 +739,73 @@ def build_app(config: Settings | LiveSettings) -> App:
             "approved_at": time.time(),
         })
 
+    # -- out-of-Slack answers (config API: GET /overrides, POST .../decide) ---
+
+    def list_overrides() -> list[dict]:
+        """The pending questions as the config API serves them. Only entries
+        with an `id` (asked by this version or later) can be answered here."""
+        out = []
+        for channel_id, thread_ts, entry in overrides.list_pending():
+            if not entry.get("id"):
+                continue
+            ev = entry.get("event") or {}
+            out.append({
+                "id": entry["id"],
+                "channel": channel_id,
+                "channel_name": entry.get("channel_name") or "",
+                "thread_ts": thread_ts,
+                "message_ts": ev.get("ts"),
+                "user": ev.get("user"),
+                "sender_name": entry.get("sender_name") or "",
+                "text": ev.get("text") or "",
+                "files": [f.get("name", "?") for f in ev.get("files") or []
+                          if isinstance(f, dict)],
+                "category": entry.get("category"),
+                "reason": entry.get("reason"),
+                "asked_at": entry.get("asked_at"),
+                "permalink": entry.get("permalink"),
+            })
+        return out
+
+    def decide_override(override_id: str, approved: bool, via: str = "alfred") -> dict:
+        """Answer a pending question by id, as the (first) owner. Consumes it
+        atomically and returns at once; the Slack posts and the replayed turn
+        run on their own thread. Raises LookupError (nothing pending with that
+        id) or RuntimeError (no owner to approve as)."""
+        owner_ids = live.current.owner_ids()
+        if not owner_ids:
+            raise RuntimeError("no_owner")
+        taken = overrides.take_pending_by_id(override_id)
+        if taken is None:
+            raise LookupError("not_pending")
+        channel_id, thread_ts, pending = taken
+        owner = owner_ids[0]
+
+        def say(text: str, thread_ts: str | None = None, **kw):
+            return app.client.chat_postMessage(channel=channel_id, text=text,
+                                               thread_ts=thread_ts, **kw)
+
+        def run() -> None:
+            try:
+                _apply_override(pending, approved, owner, channel_id, thread_ts,
+                                say, app.client, log, via=via)
+            except Exception:  # noqa: BLE001 - already logged by handle()
+                log.exception("override decided via %s failed thread=%s", via, thread_ts)
+
+        threading.Thread(target=run, name=f"override-{override_id}", daemon=True).start()
+        sender = pending.get("sender_name") or "the guest"
+        chan = pending.get("channel_name")
+        where = f" in #{chan}" if chan else ""
+        ack = (f"Approved. Alfred is working on {sender}'s request{where}." if approved
+               else f"Declined. {sender}'s request{where} stays blocked.")
+        return {"ok": True, "id": override_id, "approved": approved, "ack": ack}
+
     # message.* events (channels/groups/im) and explicit @mentions.
     app.event("message")(handle)
     app.event("app_mention")(handle)
     app.slackcc_handle = handle  # exposed for test harnesses
     app.slackcc_live = live
+    app.slackcc_overrides = config_api.Overrides(list=list_overrides, decide=decide_override)
     return app
 
 
@@ -723,7 +813,7 @@ def run(settings: Settings) -> None:
     live = LiveSettings(settings)
     app = build_app(live)
     # GET/PUT /config on loopback + SIGHUP reload: config changes without a restart.
-    config_api.start_from_env(live)
+    config_api.start_from_env(live, overrides=app.slackcc_overrides)
     handler = SocketModeHandler(app, settings.app_token)
     log.info("starting Socket Mode; %d channel(s) configured", len(settings.channels))
     handler.start()
