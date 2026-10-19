@@ -195,6 +195,8 @@ def test_new_thread_dispatches_create_before_message_with_expected_fields(tmp_pa
     assert create_cmd["worktreePath"] is None
     assert create_cmd["commandId"]
     assert "createdAt" not in create_cmd
+    # the first message seeds T3's generated title
+    assert client.dispatched("message.dispatch")["titleSeed"] == "My Thread"
 
 
 def test_thread_create_error_is_swallowed_and_message_still_dispatched(tmp_path, monkeypatch):
@@ -234,6 +236,8 @@ def test_message_dispatch_command_shape(tmp_path, monkeypatch):
     assert cmd["commandId"]
     # runtimeMode lives on thread.create only
     assert "runtimeMode" not in cmd
+    # an existing thread keeps its title
+    assert "titleSeed" not in cmd
     assert "message" not in cmd
     # the id we ledgered is the id we dispatched
     assert mirror.is_posted(thread_id, cmd["messageId"]) is True

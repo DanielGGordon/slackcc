@@ -329,6 +329,9 @@ def _run_once(
             # idle and resolves the delivery itself when one is active.
             "deliveryIntent": "auto",
             "dispatchMode": {"type": "start_immediately"},
+            # On a new thread the title is only a placeholder: as a titleSeed T3
+            # cleans it for display and has its title model name the thread.
+            **({"titleSeed": title} if is_new else {}),
         })
     except T3Error as exc:
         return TurnResult(ok=False, text="", error=str(exc))
