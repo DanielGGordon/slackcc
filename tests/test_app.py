@@ -2135,3 +2135,108 @@ def test_technical_channel_ignores_the_private_flag(make_env):
     env.backend_t3_result["value"] = TurnResult(ok=True, text="plain", session_id="s", private=True)
     call_handle(env, make_event(channel="Ct3", user="Uowner", ts="60.2"))
     assert env.client.chat_update_calls[-1]["text"] == "plain"
+
+
+# --------------------------------------------------------------------------- #
+# Owner override answered off-Slack (config API -> Alfred's phone notification)
+# --------------------------------------------------------------------------- #
+
+
+class _SyncThread:
+    """threading.Thread stand-in that runs the target on start(), so a decided
+    override's Slack posts and replay are observable without sleeping."""
+
+    def __init__(self, target=None, name=None, daemon=None, **_):
+        self._target = target
+
+    def start(self):
+        self._target()
+
+
+def test_pps_deny_pending_carries_what_an_off_slack_approver_needs(make_env):
+    env = make_env()
+    ts = _deny_guest(env)
+    pending = OverrideStore(env.overrides_file).get_pending("Cclaude", ts)
+    assert len(pending["id"]) == 16
+    assert pending["sender_name"] == "Berish Perlman"
+    assert pending["channel_name"] == "claude-chan"
+    assert pending["permalink"] == f"https://slack.example/{ts}"
+
+    [hold] = env.app.slackcc_overrides.list()
+    assert hold == {
+        "id": pending["id"], "channel": "Cclaude", "channel_name": "claude-chan",
+        "thread_ts": ts, "message_ts": ts, "user": "Uguest",
+        "sender_name": "Berish Perlman", "text": "what's the weather like", "files": [],
+        "category": "off_topic", "reason": "not the project",
+        "asked_at": pending["asked_at"], "permalink": f"https://slack.example/{ts}",
+    }
+
+
+def test_decide_override_approve_replays_the_guest_message(make_env, monkeypatch):
+    monkeypatch.setattr(app_mod.threading, "Thread", _SyncThread)
+    env = make_env()
+    ts = _deny_guest(env)
+    n_pps = len(env.pps.calls)
+    [hold] = env.app.slackcc_overrides.list()
+
+    result = env.app.slackcc_overrides.decide(hold["id"], True, "alfred")
+    assert result == {"ok": True, "id": hold["id"], "approved": True,
+                      "ack": "Approved. Alfred is working on Berish Perlman's "
+                             "request in #claude-chan."}
+    # Posted in the guest's thread via the app's own client, then replayed unjudged.
+    posts = env.app.client.chat_postMessage_calls
+    assert posts[0]["channel"] == "Cclaude" and posts[0]["thread_ts"] == ts
+    assert "<@Uowner> approved (from alfred)" in posts[0]["text"]
+    assert len(env.pps.calls) == n_pps
+    assert len(env.backend_calls) == 1
+    assert env.backend_calls[0]["prompt"].endswith("what's the weather like")
+    store = OverrideStore(env.overrides_file)
+    assert store.get_pending("Cclaude", ts) is None
+    assert store.grants("Cclaude", ts)[0]["approved_by"] == "Uowner"
+    # Answered: a second tap (or a later "yes" in the thread) finds nothing.
+    with pytest.raises(LookupError):
+        env.app.slackcc_overrides.decide(hold["id"], True, "alfred")
+    assert env.app.slackcc_overrides.list() == []
+
+
+def test_decide_override_decline_posts_and_does_not_dispatch(make_env, monkeypatch):
+    monkeypatch.setattr(app_mod.threading, "Thread", _SyncThread)
+    env = make_env()
+    ts = _deny_guest(env)
+    [hold] = env.app.slackcc_overrides.list()
+
+    result = env.app.slackcc_overrides.decide(hold["id"], False, "alfred")
+    assert result["approved"] is False
+    assert result["ack"] == "Declined. Berish Perlman's request in #claude-chan stays blocked."
+    post = env.app.client.chat_postMessage_calls[-1]
+    assert post["thread_ts"] == ts and "<@Uowner> declined (from alfred)" in post["text"]
+    assert env.backend_calls == []
+    assert OverrideStore(env.overrides_file).grants("Cclaude", ts) == []
+
+
+def test_decide_override_refusals(make_env, monkeypatch):
+    monkeypatch.setattr(app_mod.threading, "Thread", _SyncThread)
+    env = make_env()
+    ts = _deny_guest(env)
+    [hold] = env.app.slackcc_overrides.list()
+    with pytest.raises(LookupError):
+        env.app.slackcc_overrides.decide("not-an-id", True, "alfred")
+    # A newer denial in the same thread replaces the question: the old id is dead.
+    env.pps.queue({"verdict": "deny", "category": "off_topic", "reason": "still not"})
+    call_handle(env, make_event(channel="Cclaude", user="Uguest", ts="70.6",
+                                 thread_ts=ts, text="again", client_msg_id="cm-70.6"))
+    [newer] = env.app.slackcc_overrides.list()
+    assert newer["id"] != hold["id"] and newer["text"] == "again"
+    with pytest.raises(LookupError):
+        env.app.slackcc_overrides.decide(hold["id"], True, "alfred")
+    env.settings.senders.pop("Uowner")
+    with pytest.raises(RuntimeError):
+        env.app.slackcc_overrides.decide(env.app.slackcc_overrides.list()[0]["id"], True, "alfred")
+
+
+def test_owner_yes_in_slack_retires_the_off_slack_hold(make_env):
+    env = make_env()
+    ts = _deny_guest(env)
+    call_handle(env, make_event(channel="Cclaude", user="Uowner", ts="70.9",
+                                 thread_ts=ts, text="yes"))
+    assert env.app.slackcc_overrides.list() == []

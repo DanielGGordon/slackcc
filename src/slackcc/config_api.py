@@ -6,6 +6,10 @@
     PUT  /config   {if_match, channels?, senders?, dry_run?} -> validated by
                    the same parser the daemon starts with, backed up, written
                    atomically, and swapped into the running daemon. No restart.
+    GET  /overrides               the pending pps owner-override questions
+                                  (a guest message the safety screen held)
+    POST /overrides/<id>/decide   {approved: bool, via?} -> answer one as the
+                                  owner, as a "yes"/"no" in its thread would
     GET  /healthz  {"ok": true}, no token
 
 SIGHUP does the same reload from whatever is on disk (a hand edit), and keeps
@@ -30,7 +34,9 @@ import logging
 import os
 import shutil
 import signal
+import re
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -45,6 +51,16 @@ BACKUPS_KEPT = 20
 DEFAULT_PORT = 8643
 _PUT_KEYS = {"if_match", "channels", "senders", "dry_run"}
 _TMP_MARK = ".slackcc-tmp-"
+_DECIDE_PATH = re.compile(r"^/overrides/([A-Za-z0-9_-]{1,64})/decide$")
+
+
+@dataclass(frozen=True)
+class Overrides:
+    """The daemon's owner-override hooks (app.build_app): `list()` -> the
+    pending questions; `decide(id, approved, via)` -> the answer's JSON, or
+    LookupError (nothing pending with that id) / RuntimeError (no owner)."""
+    list: object
+    decide: object
 
 
 class ApiError(Exception):
@@ -312,7 +328,7 @@ class ConfigService:
 # --- HTTP ------------------------------------------------------------------------
 
 
-def make_handler(service: ConfigService, token: str):
+def make_handler(service: ConfigService, token: str, overrides: Overrides | None = None):
     expected = f"Bearer {token}".encode()
 
     class Handler(BaseHTTPRequestHandler):
@@ -340,35 +356,66 @@ def make_handler(service: ConfigService, token: str):
             try:
                 if path == "/healthz" and method == "GET":
                     return self._send(200, {"ok": True})
-                if path != "/config":
+                decide = _DECIDE_PATH.match(path)
+                if path not in ("/config", "/overrides") and not decide:
                     raise ApiError(404, "not_found", "No such route.")
                 if not self._authorized():
                     raise ApiError(401, "unauthorized", "Send Authorization: Bearer <SLACKCC_CONFIG_TOKEN>.")
+                if path == "/overrides" or decide:
+                    return self._overrides(method, decide.group(1) if decide else None)
                 if method == "GET":
                     return self._send(200, service.get())
                 if method != "PUT":
                     raise ApiError(405, "method_not_allowed", "GET or PUT.")
-                ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-                if ctype != "application/json":
-                    raise ApiError(415, "unsupported_media_type", "Send application/json.")
-                try:
-                    length = int(self.headers.get("Content-Length") or "0")
-                except ValueError:
-                    length = -1
-                if length < 0 or length > MAX_BODY:
-                    raise ApiError(413, "too_large", "The request body is too large.")
-                raw = self.rfile.read(length)
-                try:
-                    body = json.loads(raw.decode() or "null")
-                except ValueError:
-                    raise ApiError(400, "bad_request", "The request body was not valid JSON.") from None
-                return self._send(200, service.put(body))
+                return self._send(200, service.put(self._json_body()))
             except ApiError as e:
                 return self._send(e.status, e.body)
             except Exception:  # noqa: BLE001 - never a stack trace on the wire
                 log.exception("config api: %s %s failed", method, path)
                 return self._send(500, {"ok": False, "error": "internal_error",
                                         "message": "Something went wrong in slackcc."})
+
+        def _json_body(self) -> object:
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if ctype != "application/json":
+                raise ApiError(415, "unsupported_media_type", "Send application/json.")
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                length = -1
+            if length < 0 or length > MAX_BODY:
+                raise ApiError(413, "too_large", "The request body is too large.")
+            raw = self.rfile.read(length)
+            try:
+                return json.loads(raw.decode() or "null")
+            except ValueError:
+                raise ApiError(400, "bad_request", "The request body was not valid JSON.") from None
+
+        def _overrides(self, method: str, override_id: str | None) -> None:
+            if overrides is None:
+                raise ApiError(404, "not_found", "Owner overrides are not available.")
+            if override_id is None:
+                if method != "GET":
+                    raise ApiError(405, "method_not_allowed", "GET.")
+                return self._send(200, {"ok": True, "api": API_VERSION,
+                                        "pending": overrides.list()})
+            if method != "POST":
+                raise ApiError(405, "method_not_allowed", "POST.")
+            body = self._json_body()
+            if not isinstance(body, dict) or not isinstance(body.get("approved"), bool):
+                raise ApiError(400, "invalid_request", "Send {\"approved\": true|false}.")
+            via = body.get("via") if isinstance(body.get("via"), str) else "alfred"
+            via = re.sub(r"[^A-Za-z0-9 _-]", "", via)[:32] or "alfred"
+            try:
+                result = overrides.decide(override_id, body["approved"], via)
+            except LookupError:
+                raise ApiError(404, "not_pending", "Nothing pending has that id: it was "
+                               "answered, replaced by a newer question, or expired.") from None
+            except RuntimeError:
+                raise ApiError(503, "no_owner", "No owner is configured to approve as.") from None
+            log.info("config api: override %s decided approved=%s via=%s",
+                     override_id, body["approved"], via)
+            return self._send(200, result)
 
         def do_GET(self):  # noqa: N802 - http.server's naming
             self._route("GET")
@@ -389,11 +436,11 @@ def make_handler(service: ConfigService, token: str):
 
 
 def serve(service: ConfigService, token: str, *, host: str = "127.0.0.1",
-          port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
+          port: int = DEFAULT_PORT, overrides: Overrides | None = None) -> ThreadingHTTPServer:
     """Start the API on a daemon thread; the caller keeps the server to close it."""
     if host not in ("127.0.0.1", "::1", "localhost"):
         raise ValueError("the config API binds loopback only")
-    server = ThreadingHTTPServer((host, port), make_handler(service, token))
+    server = ThreadingHTTPServer((host, port), make_handler(service, token, overrides))
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, name="config-api", daemon=True).start()
     log.info("config API listening on %s:%d", host, port)
@@ -410,7 +457,7 @@ def install_sighup(service: ConfigService) -> None:
     signal.signal(signal.SIGHUP, _on_hup)
 
 
-def start_from_env(live: LiveSettings) -> ConfigService:
+def start_from_env(live: LiveSettings, overrides: Overrides | None = None) -> ConfigService:
     """What run() calls: the service, SIGHUP, and -- when SLACKCC_CONFIG_TOKEN
     is set -- the HTTP API on SLACKCC_CONFIG_PORT (default 8643)."""
     service = ConfigService(live, backup_dir=live.current.sessions_path.parent / "config-backups")
@@ -425,7 +472,7 @@ def start_from_env(live: LiveSettings) -> ConfigService:
         return service
     try:
         port = int(os.environ.get("SLACKCC_CONFIG_PORT") or DEFAULT_PORT)
-        serve(service, token, port=port)
+        serve(service, token, port=port, overrides=overrides)
     except (OSError, ValueError):
         # The bridge itself matters more than its admin API: log and carry on.
         log.exception("config API did not start; the bridge runs without it")

@@ -444,3 +444,89 @@ def test_start_from_env_without_a_token_serves_nothing(world, monkeypatch):
     monkeypatch.setenv("SLACKCC_CONFIG_TOKEN", TOKEN)
     start_from_env(world.live)
     assert started == [1]
+
+
+# --------------------------------------------------------------------------- #
+# /overrides: pending pps owner-override questions, answered off-Slack
+# --------------------------------------------------------------------------- #
+
+from slackcc.config_api import Overrides  # noqa: E402
+
+HOLD = {"id": "abc123", "channel": "C1", "thread_ts": "1.2", "text": "hi"}
+
+
+class FakeOverrides:
+    def __init__(self):
+        self.decided: list[tuple] = []
+        self.owner = True
+
+    def list(self):
+        return [HOLD]
+
+    def decide(self, override_id, approved, via):
+        if not self.owner:
+            raise RuntimeError("no_owner")
+        if override_id != HOLD["id"] or self.decided:
+            raise LookupError("not_pending")
+        self.decided.append((override_id, approved, via))
+        return {"ok": True, "id": override_id, "approved": approved, "ack": "Approved."}
+
+
+@pytest.fixture
+def ohttp(world):
+    fake = FakeOverrides()
+    server = serve(world.service, TOKEN, port=0,
+                   overrides=Overrides(list=fake.list, decide=fake.decide))
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def call(method, path, body=None, *, token=TOKEN):
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(base + path, data=data, method=method)
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    call.fake = fake
+    yield call
+    server.shutdown()
+    server.server_close()
+
+
+def test_overrides_list_and_decide(ohttp):
+    assert ohttp("GET", "/overrides", token=None)[0] == 401
+    assert ohttp("POST", "/overrides/abc123/decide", {"approved": True}, token=None)[0] == 401
+    assert ohttp("GET", "/overrides") == (200, {"ok": True, "api": 1, "pending": [HOLD]})
+
+    status, got = ohttp("POST", "/overrides/abc123/decide", {"approved": True})
+    assert status == 200 and got["approved"] is True and got["ack"] == "Approved."
+    assert ohttp.fake.decided == [("abc123", True, "alfred")]
+    # Already answered -> not_pending.
+    status, got = ohttp("POST", "/overrides/abc123/decide", {"approved": False})
+    assert status == 404 and got["error"] == "not_pending"
+
+
+def test_overrides_refusals(ohttp):
+    assert ohttp("POST", "/overrides/abc123/decide", {"approved": "yes"})[1]["error"] == "invalid_request"
+    assert ohttp("POST", "/overrides/abc123/decide", [1])[0] == 400
+    assert ohttp("GET", "/overrides/abc123/decide")[0] == 405
+    assert ohttp("POST", "/overrides", {})[0] == 405
+    assert ohttp("POST", "/overrides/bad.id!/decide", {"approved": True})[0] == 404
+    ohttp.fake.owner = False
+    status, got = ohttp("POST", "/overrides/abc123/decide", {"approved": True})
+    assert status == 503 and got["error"] == "no_owner"
+    assert ohttp.fake.decided == []
+
+
+def test_overrides_via_is_sanitised(ohttp):
+    ohttp("POST", "/overrides/abc123/decide", {"approved": True, "via": "phone<@U1>\n" * 9})
+    assert ohttp.fake.decided[0][2] == "phoneU1phoneU1phoneU1phoneU1phon"
+
+
+def test_overrides_absent_without_hooks(http):
+    assert http("GET", "/overrides")[0] == 404

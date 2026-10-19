@@ -118,6 +118,37 @@ class OverrideStore:
             self._write(data)
             return None if self._expired(entry) else entry
 
+    def list_pending(self) -> list[tuple[str, str, dict[str, Any]]]:
+        """Every unexpired pending question as (channel, thread_ts, entry),
+        oldest first -- what the config API's GET /overrides serves."""
+        out = []
+        for key, entry in self._read()["pending"].items():
+            if self._expired(entry) or ":" not in key:
+                continue
+            channel, thread_ts = key.split(":", 1)
+            out.append((channel, thread_ts, entry))
+        out.sort(key=lambda t: t[2].get("asked_at") or 0)
+        return out
+
+    def take_pending_by_id(self, override_id: str) -> tuple[str, str, dict[str, Any]] | None:
+        """Atomically consume the pending question whose `id` is this one, as
+        (channel, thread_ts, entry). None when nothing pending has the id: it
+        was answered, replaced by a newer denial in its thread, or expired --
+        so a stale phone notification can never answer a newer question."""
+        if not override_id:
+            return None
+        with self._lock:
+            data = self._read()
+            for key, entry in data["pending"].items():
+                if isinstance(entry, dict) and entry.get("id") == override_id and ":" in key:
+                    del data["pending"][key]
+                    self._write(data)
+                    if self._expired(entry):
+                        return None
+                    channel, thread_ts = key.split(":", 1)
+                    return channel, thread_ts, entry
+            return None
+
     def clear_pending(self, channel: str, thread_ts: str) -> None:
         with self._lock:
             data = self._read()

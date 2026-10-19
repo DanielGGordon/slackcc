@@ -161,3 +161,51 @@ def test_override_store_tolerates_wrong_shapes(tmp_path):
     on_disk = json.loads(path.read_text())
     assert on_disk["pending"] == {"C1:1.2": {"event": {}}}
     assert on_disk["grants"] == {"C1:1.2": [{"text": "a"}]}
+
+
+# --------------------------------------------------------------------------- #
+# Out-of-Slack answers: list_pending / take_pending_by_id (config API, Alfred)
+# --------------------------------------------------------------------------- #
+
+
+def test_override_store_list_pending_oldest_first_skips_expired(tmp_path):
+    clock = {"t": NOW}
+    store = OverrideStore(tmp_path / "o.json", now=lambda: clock["t"])
+    store.set_pending("C1", "1.2", {"id": "b", "asked_at": NOW - 10})
+    store.set_pending("C2", "3.4", {"id": "a", "asked_at": NOW - 20})
+    store.set_pending("C3", "5.6", {"id": "old", "asked_at": NOW - _OVERRIDE_TTL_SECS - 1})
+    got = store.list_pending()
+    assert [(c, t, e["id"]) for c, t, e in got] == [("C2", "3.4", "a"), ("C1", "1.2", "b")]
+
+
+def test_override_store_take_pending_by_id_consumes_only_that_question(tmp_path):
+    store = OverrideStore(tmp_path / "o.json", now=lambda: NOW)
+    store.set_pending("C1", "1.2", {"id": "x1", "asked_at": NOW})
+    store.set_pending("C2", "3.4", {"id": "y2", "asked_at": NOW})
+
+    assert store.take_pending_by_id("nope") is None
+    assert store.take_pending_by_id("") is None
+    channel, thread_ts, entry = store.take_pending_by_id("x1")
+    assert (channel, thread_ts, entry["id"]) == ("C1", "1.2", "x1")
+    # Gone, and a second taker gets nothing; the other thread is untouched.
+    assert store.take_pending_by_id("x1") is None
+    assert store.get_pending("C1", "1.2") is None
+    assert store.get_pending("C2", "3.4")["id"] == "y2"
+
+
+def test_override_store_take_by_stale_id_after_a_newer_denial(tmp_path):
+    store = OverrideStore(tmp_path / "o.json", now=lambda: NOW)
+    store.set_pending("C1", "1.2", {"id": "first", "asked_at": NOW})
+    store.set_pending("C1", "1.2", {"id": "second", "asked_at": NOW})
+    # A notification for the replaced question can't answer the newer one.
+    assert store.take_pending_by_id("first") is None
+    assert store.get_pending("C1", "1.2")["id"] == "second"
+
+
+def test_override_store_take_pending_by_id_expired_is_dropped(tmp_path):
+    clock = {"t": NOW}
+    store = OverrideStore(tmp_path / "o.json", now=lambda: clock["t"])
+    store.set_pending("C1", "1.2", {"id": "x1", "asked_at": NOW})
+    clock["t"] = NOW + _OVERRIDE_TTL_SECS + 1
+    assert store.take_pending_by_id("x1") is None
+    assert json.loads((tmp_path / "o.json").read_text())["pending"] == {}
