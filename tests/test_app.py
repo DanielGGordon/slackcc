@@ -2240,3 +2240,49 @@ def test_owner_yes_in_slack_retires_the_off_slack_hold(make_env):
     call_handle(env, make_event(channel="Cclaude", user="Uowner", ts="70.9",
                                  thread_ts=ts, text="yes"))
     assert env.app.slackcc_overrides.list() == []
+
+
+# --------------------------------------------------------------------------- #
+# handle(): context watch (context_watch.py) -- warn at 200k, compact next turn
+# --------------------------------------------------------------------------- #
+
+def test_context_watch_warns_then_compacts_on_the_next_message(make_env):
+    env = make_env()
+    env.backend_t3_result["value"] = TurnResult(ok=True, text="big answer",
+                                                session_id="slack-Ct3-70-1", context_tokens=212_000)
+    call_handle(env, make_event(channel="Ct3", user="Uowner", ts="70.1", text="one"))
+    final = env.client.chat_update_calls[-1]["text"]
+    assert final.startswith("big answer") and "212k" in final and "compact" in final
+    assert env.backend_t3_calls[0]["compact_first"] is False
+
+    # The next message in the same thread is compacted first, then answered.
+    env.backend_t3_result["value"] = TurnResult(ok=True, text="short answer",
+                                                session_id="slack-Ct3-70-1", context_tokens=35_000,
+                                                compacted=True)
+    call_handle(env, make_event(channel="Ct3", user="Uowner", ts="70.2", text="two",
+                                thread_ts="70.1"))
+    assert env.backend_t3_calls[1]["compact_first"] is True
+    assert env.client.chat_update_calls[-1]["text"] == "short answer"
+
+    # Spent: a third message does not compact again.
+    call_handle(env, make_event(channel="Ct3", user="Uowner", ts="70.3", text="three",
+                                thread_ts="70.1"))
+    assert env.backend_t3_calls[2]["compact_first"] is False
+
+
+def test_context_watch_stays_quiet_under_the_threshold(make_env):
+    env = make_env()
+    env.backend_t3_result["value"] = TurnResult(ok=True, text="fine", session_id="sess-t3-1",
+                                                context_tokens=80_000)
+    call_handle(env, make_event(channel="Ct3", user="Uowner", ts="71.1", text="hi"))
+    assert env.client.chat_update_calls[-1]["text"] == "fine"
+
+
+def test_context_watch_customer_warning_is_plain(make_env):
+    env = customer_env(make_env)
+    env.backend_t3_result["value"] = TurnResult(ok=True, text=GOOD_FINAL, session_id="s",
+                                                context_tokens=260_000)
+    call_handle(env, make_event(channel="Ccust", user="Uguest", ts="72.1"))
+    final = env.client.chat_update_calls[-1]["text"]
+    assert final.startswith("Your booking page now shows the new price.")
+    assert "tidy it up" in final and "token" not in final

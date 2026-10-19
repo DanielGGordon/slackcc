@@ -55,6 +55,11 @@ class TurnResult:
     # too full for T3 to re-inject history ("Insufficient context allowance
     # for the provider handoff"). A `/compact` clears it.
     context_full: bool = False
+    # t3 backend only: tokens in the thread's live context after this turn
+    # (T3's provider-thread `contextUsage`); None when T3 didn't report one.
+    context_tokens: int | None = None
+    # t3 backend only: the bridge compacted the thread before running this turn.
+    compacted: bool = False
 
 
 def _build_options(

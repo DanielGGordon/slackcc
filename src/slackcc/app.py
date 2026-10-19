@@ -15,7 +15,7 @@ from pathlib import Path
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-from . import backend, backend_t3, bridgedoc, config_api, customer, t3_mirror
+from . import backend, backend_t3, bridgedoc, config_api, context_watch, customer, t3_mirror
 from .claims import ClaimStore
 from .config import ChannelConfig, LiveSettings, SenderPolicy, Settings
 from .names import NameResolver
@@ -220,6 +220,9 @@ def build_app(config: Settings | LiveSettings) -> App:
     # What each customer-channel Slack thread has been told (customer.py);
     # daemon-only state, so it sits next to sessions.json like the files above.
     ledger = customer.Ledger(settings.sessions_path.parent / "customer_ledger")
+    # t3 threads warned about a long context, due a compaction on their next turn.
+    watch = context_watch.ContextWatch(
+        settings.sessions_path.parent / "context_watch.json", settings.context_warn_tokens)
     # Configured sender names are reserved: an unconfigured Slack account
     # whose profile says "Dan" is shown by id, not as the owner.
     resolver = NameResolver(reserved={sp.name for sp in settings.senders.values()})
@@ -428,6 +431,8 @@ def build_app(config: Settings | LiveSettings) -> App:
                                "so I can't process this message. Please try again later.")
                         return
 
+            compact_first = False
+            t3_thread_id: str | None = None
             if cfg.backend == "t3" and t3_client and mirror:
                 # Slack thread <-> T3 thread, 1:1, deterministic id (so resume
                 # survives a lost sessions.json). message.dispatch has no
@@ -531,7 +536,10 @@ def build_app(config: Settings | LiveSettings) -> App:
                         except Exception:  # noqa: BLE001 - paging must not kill the turn
                             logger.warning("approval DM to %s failed", owner_id, exc_info=True)
 
+                t3_thread_id = thread_id
+                compact_first = resume is not None and watch.due(thread_id)
                 result = backend_t3.run_turn(
+                    compact_first=compact_first,
                     prompt="\n\n".join(filter(None, [header, protocol, guard, prompt])),
                     thread_id=thread_id,
                     is_new=resume is None,
@@ -575,6 +583,20 @@ def build_app(config: Settings | LiveSettings) -> App:
             if result.session_id:
                 sessions.set(channel_id, thread_ts, result.session_id)
 
+            # Context watch (t3): any compaction the bridge ran settles the mark;
+            # a turn that lands at/over the threshold appends a heads-up that the
+            # next message will compact the thread.
+            warn_tokens = None
+            if t3_thread_id:
+                if compact_first or result.compacted:
+                    # The pre-turn compact was attempted (or the full-session
+                    # safety net ran one): the mark is spent either way, so a
+                    # failing compact can't make every later turn retry it.
+                    watch.clear(t3_thread_id)
+                if result.ok and not result.private and \
+                        watch.observe(t3_thread_id, result.context_tokens):
+                    warn_tokens = result.context_tokens
+
             if customer_mode:
                 # Only the agent's marked block is for the customer; anything
                 # else (no block, a technical-looking block, a failed run) gets
@@ -590,6 +612,9 @@ def build_app(config: Settings | LiveSettings) -> App:
                     outcome = customer.resolve_final(result.text)
                     if outcome.kind == "block":
                         source, final = "block", outcome.text
+                        if warn_tokens:
+                            final = context_watch.append_warning(final, warn_tokens,
+                                                                 customer=True)
                     else:
                         why = outcome.why or "empty final message"
                 elif result.awaiting_approval:
@@ -610,6 +635,8 @@ def build_app(config: Settings | LiveSettings) -> App:
 
             if result.ok:
                 final = result.text or "(no output)"
+                if warn_tokens:
+                    final = context_watch.append_warning(result.text, warn_tokens)
             elif result.awaiting_approval:
                 logger.info("turn parked on approval; released: %s", result.error)
                 final = (f":raised_hand: This needs {settings.t3_owner}'s approval in T3 "

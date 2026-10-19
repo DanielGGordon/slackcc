@@ -46,6 +46,17 @@ Slack channel ──(Socket Mode)──> slackcc daemon ──┬──> backend
   the provider handoff"). The `t3` backend spots that failure, sends `/compact`
   into the thread, and retries the same prompt once. A failed compaction or a
   second failure is reported as usual -- never a loop.
+- **Long-thread heads-up (context watch):** Sonnet 5.5 keeps its full 1M-token
+  window (T3's Claude settings are untouched, so Claude Code won't compact on its
+  own until it's nearly full). Instead the bridge watches each thread's context
+  size (T3's provider-thread `contextUsage`). The first reply that lands at or
+  past 200k tokens gets a note appended -- the next message will compact the
+  conversation; stay in the thread or start a fresh one. On that next message
+  the bridge sends `/compact` into the thread, then runs the message (a failed
+  compact is logged and the message runs anyway). Customer channels get the same
+  note in plain words (no token counts). Threshold: `SLACKCC_CONTEXT_WARN_TOKENS`
+  (default 200000); state in `context_watch.json` beside `sessions.json`. This
+  complements the "full sessions self-heal" backstop above.
 - **Owner override for screened messages:** when pps declines a guest's
   message (`enforce` mode), the bot posts the denial and then asks the owners
   in the same thread, quoting the request so it's unambiguous what a "yes"

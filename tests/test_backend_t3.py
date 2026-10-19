@@ -1142,3 +1142,71 @@ def test_retry_does_not_recreate_a_new_thread_or_resend_images(tmp_path, monkeyp
                                        completed(reply="ok", reply_id="a")])
     go(client, mirror, "t-new-full", is_new=True)
     assert client.dispatch_types().count("thread.create") == 1
+
+
+# --- context watch: token reading + bridge-driven pre-compaction --------------
+
+def with_usage(proj, used, *, active="pt-1", others=()):
+    """Attach providerThreads (the active one reporting `used` tokens)."""
+    proj["thread"]["activeProviderThreadId"] = active
+    proj["providerThreads"] = [
+        {"id": active, "updatedAt": "2026-10-19T01:00:00Z",
+         "contextUsage": {"usedTokens": used, "maxTokens": 1000000}}, *others]
+    return proj
+
+
+def test_context_tokens_come_from_the_active_provider_thread(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    mirror = make_mirror(tmp_path, "t-usage")
+    stale = {"id": "pt-old", "updatedAt": "2026-10-19T09:00:00Z",
+             "contextUsage": {"usedTokens": 999, "maxTokens": 1000000}}
+    client = FakeT3Client(projections=[
+        lambda mid: with_usage(projection(mid), 215_000, others=[stale])])
+    assert go(client, mirror, "t-usage").context_tokens == 215_000
+
+
+def test_context_tokens_none_when_t3_reports_nothing(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    mirror = make_mirror(tmp_path, "t-nousage")
+    client = FakeT3Client(projections=[completed()])
+    assert go(client, mirror, "t-nousage").context_tokens is None
+
+
+def test_compact_first_compacts_then_runs_the_message(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    mirror = make_mirror(tmp_path, "t-pre")
+    client = FakeT3Client(projections=[
+        completed(reply=None),
+        lambda mid: with_usage(projection(mid, reply="the answer", reply_id="a-2"), 30_000),
+    ])
+    progress = []
+
+    result = go(client, mirror, "t-pre", prompt="next question", compact_first=True,
+                on_progress=progress.append)
+
+    assert message_texts(client) == ["/compact", "next question"]
+    assert result.ok and result.text == "the answer"
+    assert result.compacted is True and result.context_tokens == 30_000
+    assert len(progress) == 1 and "tidying" in progress[0]
+
+
+def test_failed_pre_compact_still_runs_the_message(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    mirror = make_mirror(tmp_path, "t-pre-fail")
+    client = FakeT3Client(projections=[
+        lambda mid: projection(mid, "failed", reply=None),
+        completed(reply="answered anyway", reply_id="a-3"),
+    ])
+
+    result = go(client, mirror, "t-pre-fail", prompt="next question", compact_first=True)
+
+    assert message_texts(client) == ["/compact", "next question"]
+    assert result.ok and result.text == "answered anyway" and result.compacted is False
+
+
+def test_compact_first_is_skipped_for_a_new_thread(tmp_path, monkeypatch):
+    fast_poll(monkeypatch)
+    mirror = make_mirror(tmp_path, "t-new")
+    client = FakeT3Client(projections=[completed()])
+    go(client, mirror, "t-new", is_new=True, compact_first=True)
+    assert message_texts(client) == ["hello"]
