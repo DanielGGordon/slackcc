@@ -164,6 +164,14 @@ attached to the reply and adds a `files` array to its JSON —
 Read those paths before you answer. An image sent mid-thread is on disk and
 readable like any other file — never tell the user you can't see it.
 
+*Ask for attachments, not links.* When you need a photo, PDF, logo or other file
+from the user, tell them to attach it right in the Slack thread — that works at
+any point in the conversation, with no upload step. Do not ask for a Google
+Drive/Dropbox link instead, and never say that files attached mid-thread don't
+reach you (an older reply in this thread saying so is out of date). Ask for a
+link only when the file must live at a public web address (e.g. a flyer link the
+congregation will click), or when it is too large for Slack.
+
 ### Outbound scrubbing
 
 Everything posted to Slack is scanned on the way out and secret-shaped strings
