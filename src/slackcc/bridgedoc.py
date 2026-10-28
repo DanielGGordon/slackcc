@@ -58,6 +58,31 @@ def _claude_md(project_dir: Path | str) -> Path:
     return Path(project_dir) / "CLAUDE.md"
 
 
+_GLOBAL_CONFIG_DIRS = ("~/.claude", "~/.claude_work")
+
+
+def is_global_claude_md(project_dir: Path | str) -> bool:
+    """True when the project's CLAUDE.md IS the user's global Claude Code
+    instructions file (resolving symlinks), so writing the protocol there would
+    load it in every session of every project -- twice in bridged ones.
+
+    The operator's dotfiles repo is itself a bridged channel and its CLAUDE.md
+    is symlinked to ~/.claude/CLAUDE.md (context audit 2026-10-28); such a
+    project keeps the inline fallback (`hidden`) instead."""
+    try:
+        target = _claude_md(project_dir).resolve()
+    except OSError:
+        return False
+    for d in _GLOBAL_CONFIG_DIRS:
+        try:
+            g = (Path(d).expanduser() / "CLAUDE.md").resolve()
+        except OSError:
+            continue
+        if g == target:
+            return True
+    return False
+
+
 def _installed_body(project_dir: Path | str) -> str | None:
     """Text between the markers in this project's CLAUDE.md, or None if there's
     no section (or no readable file). A truncated section (no end marker) reads
@@ -115,8 +140,12 @@ def install(project_dir: Path | str) -> str:
 
     Idempotent: replaces an existing section in place, appends if there's none,
     creates the file if it doesn't exist. Returns "created", "updated" or
-    "unchanged" so callers can report honestly."""
+    "unchanged" so callers can report honestly. Raises OSError when the file is
+    the user's global CLAUDE.md (`is_global_claude_md`): the daemon then falls
+    back to the inline copy, like any unwritable file."""
     path = _claude_md(project_dir)
+    if is_global_claude_md(project_dir):
+        raise OSError(f"{path} is the global Claude Code CLAUDE.md; the protocol is injected inline instead")
     new_section = section()
 
     if not path.exists():
