@@ -154,7 +154,10 @@ Slack channel ──(Socket Mode)──> slackcc daemon ──┬──> backend
   rewrites a missing *or out-of-date* `CLAUDE.md` section itself (the same thing
   `slackcc init-project` does), so a new channel or a protocol change needs no
   manual step. Only if the file can't be written is the protocol injected inline
-  on that first turn — as a hidden HTML comment, with a log warning.
+  on that first turn — as a hidden HTML comment, with a log warning. A project
+  whose `CLAUDE.md` *is* the user's global `~/.claude/CLAUDE.md` (the dotfiles
+  channel; symlinks resolved) is treated the same way and never written: the
+  protocol would otherwise load in every session of every project.
 
 ## 1. Create the Slack app (one-time)
 

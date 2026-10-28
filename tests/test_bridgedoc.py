@@ -239,3 +239,34 @@ def test_hidden_is_one_comment_the_inline_protocol_cannot_close_early():
     # The protocol quotes comments; only our own closing delimiter may remain.
     assert hidden.count("-->") == 1
     assert hidden.count("<!--") == 1
+
+
+def test_install_refuses_the_global_claude_md(tmp_path, monkeypatch):
+    # The operator's dotfiles repo is a bridged channel whose CLAUDE.md is the
+    # symlinked global ~/.claude/CLAUDE.md: the protocol must not be written
+    # there (it would load in every session of every project).
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    repo = tmp_path / "dotfiles"
+    repo.mkdir()
+    (repo / "CLAUDE.md").write_text("# global rules\n")
+    (home / ".claude" / "CLAUDE.md").symlink_to(repo / "CLAUDE.md")
+    monkeypatch.setenv("HOME", str(home))
+    assert bridgedoc.is_global_claude_md(repo) is True
+    import pytest
+    with pytest.raises(OSError):
+        bridgedoc.install(repo)
+    assert (repo / "CLAUDE.md").read_text() == "# global rules\n"
+    assert bridgedoc.ensure_current(repo) is False  # -> app.py injects it inline
+    other = tmp_path / "proj"
+    other.mkdir()
+    assert bridgedoc.is_global_claude_md(other) is False
+    assert bridgedoc.install(other) == "created"
+
+
+def test_packaged_doc_names_the_auto_ship_exception_and_backlog_rules():
+    rendered = bridgedoc.render()
+    assert "Berish Perlman" in rendered and "Rabbi" in rendered
+    assert "stops at an\nopen PR" in rendered or "stops at an open PR" in rendered
+    assert "call no backlog tool" in rendered
+    assert "a staging workflow may replace it later" not in rendered
