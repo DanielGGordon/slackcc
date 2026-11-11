@@ -89,6 +89,8 @@ _ASK_QUOTE_MAX = 200
 _GRANT_BLOCK_OPEN = "<<<PERMITTED_REQUESTS"
 _GRANT_BLOCK_CLOSE = "PERMITTED_REQUESTS>>>"
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+# Slack user mentions, to tell a bare ping ("<@U123>") from a real message.
+_SLACK_MENTION = re.compile(r"<@[A-Z0-9]+(?:\|[^>]*)?>")
 
 
 def _quote_grant(text: str, limit: int) -> str:
@@ -309,6 +311,24 @@ def build_app(config: Settings | LiveSettings) -> App:
             log.info("skip claimed thread channel=%s thread=%s", channel_id, thread_ts)
             return
 
+        # This sender already has a message held for owner approval in this
+        # thread. The agent never sees a held message (it would bypass the
+        # screen), and T3 has no thread for it until it runs, so a follow-up
+        # must not start a turn that pretends the thread began with the ping.
+        # (An approved replay consumed its pending entry before getting here.)
+        held = overrides.get_pending(channel_id, thread_ts)
+        if held is not None and (held.get("event") or {}).get("user") != user:
+            held = None
+        if held is not None and not pps_override \
+                and not _SLACK_MENTION.sub("", text).strip() and not files:
+            mentions = " ".join(f"<@{oid}>" for oid in settings.owner_ids())
+            say(text=(f"Your earlier message in this thread is still waiting for "
+                      f"{settings.t3_owner}'s approval, so there's nothing for me to "
+                      f"work on yet. I'll pick it up as soon as it's approved."
+                      + (f"\n{mentions} — it's waiting on you above." if mentions else "")),
+                thread_ts=thread_ts)
+            return
+
         # Inbound files: download so the agent can Read them.
         local_paths: list[Path] = []
         if files:
@@ -350,6 +370,15 @@ def build_app(config: Settings | LiveSettings) -> App:
             sender_name, channel_name, body,
             first_turn=resume is None, n_files=len(local_paths) or len(files),
         )]
+        if held is not None:
+            # Category only (a fixed label): the reason is judge-written from
+            # the held text. Shows in the T3 GUI too, so the owner sees why.
+            parts.append(
+                f"[Bridge note: earlier in this thread {sender_name} sent a message the "
+                f"safety screen held ({held.get('category') or 'other'}); it is awaiting "
+                f"{settings.t3_owner}'s approval and was NOT given to you. Don't guess "
+                "what it said; if this message depends on it, say it is still waiting "
+                "on approval.]")
         if local_paths:
             listing = "\n".join(f"- {p}" for p in local_paths)
             parts.append(
