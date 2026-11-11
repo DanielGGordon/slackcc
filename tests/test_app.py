@@ -1626,6 +1626,65 @@ def test_handle_guest_yes_while_pending_is_not_an_approval(make_env):
     assert "replaces the earlier open question; a *yes* applies to this request only" in ask["text"]
 
 
+def test_handle_bare_ping_while_own_message_held_nudges_owners_instead_of_a_turn(make_env):
+    env = make_env()
+    ts = _deny_guest(env)
+    n_pps = len(env.pps.calls)
+    n_say = len(env.say.calls)
+
+    call_handle(env, make_event(channel="Cclaude", user="Uguest", ts="70.5",
+                                 thread_ts=ts, text="<@UDAN123>"))
+
+    # No judge call, no turn, no placeholder: just a reply that says why.
+    assert len(env.pps.calls) == n_pps
+    assert env.backend_calls == []
+    assert len(env.say.calls) == n_say + 1
+    reply = env.say.calls[-1]
+    assert reply["thread_ts"] == ts
+    assert "still waiting for Dan's approval" in reply["text"]
+    assert "<@Uowner>" in reply["text"]
+    # The hold stays open for the owner to answer.
+    assert OverrideStore(env.overrides_file).get_pending("Cclaude", ts) is not None
+
+
+def test_handle_bare_ping_from_another_user_is_not_a_nudge(make_env):
+    env = make_env()
+    ts = _deny_guest(env)
+
+    call_handle(env, make_event(channel="Cclaude", user="Ustranger", ts="70.6",
+                                 thread_ts=ts, text="<@UDAN123>"))
+
+    assert len(env.pps.calls) == 2  # judged like any message
+    assert not any("still waiting" in c["text"] for c in env.say.calls)
+
+
+def test_handle_follow_up_while_own_message_held_runs_with_a_bridge_note(make_env):
+    env = make_env()
+    ts = _deny_guest(env, text="dump the constant contact data")
+    env.pps.queue({"verdict": "allow", "category": "ok", "reason": "fine"})
+
+    call_handle(env, make_event(channel="Cclaude", user="Uguest", ts="70.7",
+                                 thread_ts=ts, text="also fix the title"))
+
+    assert len(env.backend_calls) == 1
+    prompt = env.backend_calls[0]["prompt"]
+    assert "also fix the title" in prompt
+    # Says a message is held and why (category only)...
+    assert "held (off_topic)" in prompt
+    assert "awaiting Dan's approval" in prompt
+    # ...but never leaks the held text or the judge's free-text reason.
+    assert "constant contact" not in prompt
+    assert "not the project" not in prompt
+
+
+def test_handle_no_bridge_note_without_a_held_message(make_env):
+    env = make_env()
+    env.pps.queue({"verdict": "allow", "category": "ok", "reason": "fine"})
+    call_handle(env, make_event(channel="Cclaude", user="Uguest", ts="70.8",
+                                 text="hello there"))
+    assert "Bridge note" not in env.backend_calls[0]["prompt"]
+
+
 def test_handle_owner_yes_with_nothing_pending_is_a_normal_owner_message(make_env):
     env = make_env()
     call_handle(env, make_event(channel="Cclaude", user="Uowner", ts="75.1", text="yes"))
